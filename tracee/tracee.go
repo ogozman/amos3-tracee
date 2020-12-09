@@ -102,6 +102,7 @@ type Tracee struct {
 	DecParamName  [2]map[argTag]string
 	EncParamName  [2]map[string]argTag
 	pidsInMntns   bucketsCache //record the first n PIDs (host) in each mount namespace, for internal usage
+	mnt_ns_id     uint32
 }
 
 type counter int32
@@ -125,7 +126,7 @@ type statsStore struct {
 }
 
 // New creates a new Tracee instance based on a given valid TraceeConfig
-func New(cfg TraceeConfig) (*Tracee, error) {
+func New(cfg TraceeConfig, mnt_ns_trace uint32) (*Tracee, error) {
 	var err error
 
 	err = cfg.Validate()
@@ -153,7 +154,8 @@ func New(cfg TraceeConfig) (*Tracee, error) {
 	}
 	// create tracee
 	t := &Tracee{
-		config: cfg,
+		config:    cfg,
+		mnt_ns_id: mnt_ns_trace,
 	}
 	ContainerMode := (t.config.Mode == ModeContainerAll || t.config.Mode == ModeContainerNew)
 	printObj, err := newEventPrinter(t.config.OutputFormat, ContainerMode, t.config.EventsFile, t.config.ErrorsFile)
@@ -376,7 +378,7 @@ func (t *Tracee) initEventsParams() map[int32][]eventParam {
 func (t *Tracee) populateBPFMaps() error {
 	//This is basically just a test, we create the map and add host process
 	mnt_ns_filter, _ := t.bpfModule.GetMap("mnt_ns_filter")
-	mnt_ns_filter.Update(uint32(4026531840), uint32(4026531840))
+	mnt_ns_filter.Update(t.mnt_ns_id, t.mnt_ns_id)
 	chosenEventsMap, _ := t.bpfModule.GetMap("chosen_events_map")
 	for e, chosen := range t.eventsToTrace {
 		// Set chosen events map according to events chosen by the user
@@ -592,18 +594,12 @@ func (t *Tracee) Run() error {
 	signal.Notify(sig, os.Interrupt)
 	done := make(chan struct{})
 	t.printer.Preamble()
-	fmt.Print("Here we have typed preambl\n \n \n \n")
 	t.eventsPerfMap.Start()
-
-	fmt.Print("Started perfmap\n \n \n \n")
 	t.fileWrPerfMap.Start()
-
-	fmt.Print("start filewr \n \n \n")
 	go t.processLostEvents()
 	go t.runEventPipeline(done)
 	go t.processFileWrites()
 	<-sig
-	fmt.Print("we are done now\n")
 	t.eventsPerfMap.Stop()
 	t.fileWrPerfMap.Stop()
 	t.printer.Epilogue(t.stats)

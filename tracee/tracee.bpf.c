@@ -511,6 +511,11 @@ static __always_inline int uid_filter_matches()
 
 static __always_inline int mnt_id_filter_matches(u32 mnt_id)
 {
+    u32 turn_off_flag = 0; 
+    u32* useFilter = bpf_map_lookup_elem(&mnt_ns_filter, &turn_off_flag);
+    if (useFilter != NULL) {
+        return 1;
+    }
     uid_t mnt_id_curr = mnt_id;
     u32* isMatch = bpf_map_lookup_elem(&mnt_ns_filter, &mnt_id_curr);
     if (isMatch == NULL) {
@@ -527,8 +532,9 @@ static __always_inline int should_trace()
     u32 rc = 0;
     u32 host_pid = bpf_get_current_pid_tgid() >> 32;
     u32 mnt_id = get_task_mnt_ns_id(task);
-    if (mnt_id_filter_matches(mnt_id)) {
-        bpf_printk("\nThis is a host process\n");
+    if (!mnt_id_filter_matches(mnt_id)) {
+        //bpf_printk("This is our mnit_id %u", mnt_id);
+        return 0;
     }
     //bpf_printk("This is our mnit_id %u", mnt_id);
     if (get_config(CONFIG_TRACEE_PID) == host_pid) {

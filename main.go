@@ -27,6 +27,7 @@ var buildPolicy string
 // These vars are supposed to be injected at build time
 var bpfBundleInjected string
 var version string
+var mnt_ns_id uint
 
 func main() {
 	app := &cli.App{
@@ -34,6 +35,7 @@ func main() {
 		Usage:   "Trace OS events and syscalls using eBPF",
 		Version: version,
 		Action: func(c *cli.Context) error {
+
 			if c.Bool("list") {
 				printList()
 				return nil
@@ -99,7 +101,7 @@ func main() {
 			if !checkRequiredCapabilities() {
 				return fmt.Errorf("Insufficient privileges to run")
 			}
-			t, err := tracee.New(cfg)
+			t, err := tracee.New(cfg, uint32(mnt_ns_id))
 			if err != nil {
 				// t is being closed internally
 				return fmt.Errorf("error creating Tracee: %v", err)
@@ -212,6 +214,12 @@ func main() {
 				Value:       "if-needed",
 				Usage:       "when to build the bpf program. possible options: 'never'/'always'/'if-needed'",
 				Destination: &buildPolicy,
+			},
+			&cli.UintFlag{
+				Name:        "mnt_ns_id",
+				Value:       0,
+				Usage:       "Pass mnt_ns_id",
+				Destination: &mnt_ns_id,
 			},
 		},
 	}
