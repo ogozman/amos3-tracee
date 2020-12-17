@@ -234,8 +234,7 @@ BPF_HASH(chosen_events_map, u32, u32);              // Events chosen by the user
 BPF_HASH(pids_map, u32, u32);                       // Save container pid namespaces
 BPF_HASH(args_map, u64, args_t);                    // Persist args info between function entry and return
 BPF_HASH(ret_map, u64, u64);                        // Persist return value to be used in tail calls
-BPF_HASH(uid_filter, u32, u32);                     // Used to filter events by UID
-BPF_HASH(mnt_ns_filter, u32, u32);                  // Used to filter event by mnt_namespace
+BPF_HASH(uid_filter, u32, u32);                     // Used to filter events by UID                 // Used to filter event by mnt_namespace
 BPF_HASH(bin_args_map, u64, bin_args_t);            // Persist args for send_bin funtion
 BPF_HASH(sys_32_to_64_map, u32, u32);               // Map 32bit syscalls numbers to 64bit syscalls numbers
 BPF_HASH(params_types_map, u32, u64);               // Encoded parameters types for event
@@ -247,6 +246,16 @@ BPF_PERCPU_ARRAY(bufs_off, u32, MAX_BUFFERS);       // Holds offsets to bufs res
 BPF_PROG_ARRAY(prog_array, MAX_TAIL_CALL);          // Used to store programs for tail calls
 BPF_PROG_ARRAY(sys_enter_tails, MAX_EVENT_ID);      // Used to store programs for tail calls
 BPF_PROG_ARRAY(sys_exit_tails, MAX_EVENT_ID);       // Used to store programs for tail calls
+
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} mnt_ns_filter SEC(".maps"); //map where mnt ns ids to filter are stored
+
 
 /*================================== EVENTS ====================================*/
 

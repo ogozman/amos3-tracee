@@ -39,6 +39,7 @@ type TraceeConfig struct {
 	ErrorsFile            *os.File
 	maxPidsCache          int // maximum number of pids to cache per mnt ns (in Tracee.pidsInMntns)
 	BPFObjPath            string
+	NSMapPinning          string
 }
 
 type Filter struct {
@@ -522,7 +523,11 @@ func (t *Tracee) initBPF(bpfObjectPath string) error {
 			}
 		}
 	}
-
+	if t.config.NSMapPinning != "" {
+		fmt.Println("\nChanging pinning to ")
+		fmt.Println(t.config.NSMapPinning)
+		t.bpfModule.ChangeMapPin("mnt_ns_filter", t.config.NSMapPinning)
+	}
 	err = t.bpfModule.BPFLoadObject()
 	if err != nil {
 		return err

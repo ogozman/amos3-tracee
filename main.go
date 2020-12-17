@@ -70,6 +70,7 @@ func main() {
 				SecurityAlerts:        c.Bool("security-alerts"),
 				EventsFile:            os.Stdout,
 				ErrorsFile:            os.Stderr,
+				NSMapPinning:          c.String("mnt_ns_map"),
 			}
 			capture := c.StringSlice("capture")
 			for _, cap := range capture {
@@ -220,6 +221,11 @@ func main() {
 				Value:       0,
 				Usage:       "Pass mnt_ns_id",
 				Destination: &mnt_ns_id,
+			},
+			&cli.StringFlag{
+				Name:  "mnt_ns_map",
+				Value: "",
+				Usage: "A path to bpf map where the mnt_ns_namespace ids are stored as keys and values are ignored",
 			},
 		},
 	}
