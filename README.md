@@ -136,3 +136,6 @@ You can also use `-t` e.g. `-t p:all`
 ## Secure tracing
 
 When Tracee reads information from user programs it is subject to a race condition where the user program might be able to change the arguments after Tracee has read them. For example, a program invoked `execve("/bin/ls", NULL, 0)`, Tracee picked that up and will report that, then the program changed the first argument from `/bin/ls` to `/bin/bash`, and this is what the kernel will execute. To mitigate this, Tracee also provide "LSM" (Linux Security Module) based events, for example, the `bprm_check` event which can be reported by tracee and cross-referenced with the reported regular syscall event.
+
+## Mount space filtering
+Currently tracee is able track the event in specific namespaces. There are two different ways to do. If you need to track the event in mount namespace, then you can pass it as an argument when you call tracc with `--mnt_ns_id` tag. If you have a list to filter for, then you will to give the bpf map of the with mount namepsaces ids as key to tracee. This is done by creating a pinned map and then providian a pinning path to tracee via cmd argument `--mnt_ns_map`
