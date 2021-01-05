@@ -312,7 +312,11 @@ func (m *Module) ChangeMapPin(mapName string, pinning string) error {
 
 func (b *BPFMap) Update(key, value interface{}) error {
 	var keyPtr, valuePtr unsafe.Pointer
-	if k, isType := key.(int32); isType {
+	if k, isType := key.(int8); isType {
+		keyPtr = unsafe.Pointer(&k)
+	} else if k, isType := key.(uint8); isType {
+		keyPtr = unsafe.Pointer(&k)
+	} else if k, isType := key.(int32); isType {
 		keyPtr = unsafe.Pointer(&k)
 	} else if k, isType := key.(uint32); isType {
 		keyPtr = unsafe.Pointer(&k)
@@ -320,10 +324,16 @@ func (b *BPFMap) Update(key, value interface{}) error {
 		keyPtr = unsafe.Pointer(&k)
 	} else if k, isType := key.(uint64); isType {
 		keyPtr = unsafe.Pointer(&k)
+	} else if k, isType := key.([]byte); isType {
+		keyPtr = unsafe.Pointer(&k[0])
 	} else {
 		return fmt.Errorf("failed to update map %s: unknown key type %T", b.name, key)
 	}
-	if v, isType := value.(int32); isType {
+	if v, isType := value.(int8); isType {
+		valuePtr = unsafe.Pointer(&v)
+	} else if v, isType := value.(uint8); isType {
+		valuePtr = unsafe.Pointer(&v)
+	} else if v, isType := value.(int32); isType {
 		valuePtr = unsafe.Pointer(&v)
 	} else if v, isType := value.(uint32); isType {
 		valuePtr = unsafe.Pointer(&v)
@@ -338,6 +348,50 @@ func (b *BPFMap) Update(key, value interface{}) error {
 	}
 
 	err := C.bpf_map_update_elem(b.fd, keyPtr, valuePtr, C.BPF_ANY)
+	if err != 0 {
+		return fmt.Errorf("failed to update map %s", b.name)
+	}
+	return nil
+}
+
+func (b *BPFMap) UpdateExist(key, value interface{}) error {
+	var keyPtr, valuePtr unsafe.Pointer
+	if k, isType := key.(int8); isType {
+		keyPtr = unsafe.Pointer(&k)
+	} else if k, isType := key.(uint8); isType {
+		keyPtr = unsafe.Pointer(&k)
+	} else if k, isType := key.(int32); isType {
+		keyPtr = unsafe.Pointer(&k)
+	} else if k, isType := key.(uint32); isType {
+		keyPtr = unsafe.Pointer(&k)
+	} else if k, isType := key.(int64); isType {
+		keyPtr = unsafe.Pointer(&k)
+	} else if k, isType := key.(uint64); isType {
+		keyPtr = unsafe.Pointer(&k)
+	} else if k, isType := key.([]byte); isType {
+		keyPtr = unsafe.Pointer(&k[0])
+	} else {
+		return fmt.Errorf("failed to update map %s: unknown key type %T", b.name, key)
+	}
+	if v, isType := value.(int8); isType {
+		valuePtr = unsafe.Pointer(&v)
+	} else if v, isType := value.(uint8); isType {
+		valuePtr = unsafe.Pointer(&v)
+	} else if v, isType := value.(int32); isType {
+		valuePtr = unsafe.Pointer(&v)
+	} else if v, isType := value.(uint32); isType {
+		valuePtr = unsafe.Pointer(&v)
+	} else if v, isType := value.(int64); isType {
+		valuePtr = unsafe.Pointer(&v)
+	} else if v, isType := value.(uint64); isType {
+		valuePtr = unsafe.Pointer(&v)
+	} else if v, isType := value.([]byte); isType {
+		valuePtr = unsafe.Pointer(&v[0])
+	} else {
+		return fmt.Errorf("failed to update map %s: unknown value type %T", b.name, value)
+	}
+
+	err := C.bpf_map_update_elem(b.fd, keyPtr, valuePtr, C.BPF_EXIST)
 	if err != 0 {
 		return fmt.Errorf("failed to update map %s", b.name)
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,7 +28,6 @@ var buildPolicy string
 // These vars are supposed to be injected at build time
 var bpfBundleInjected string
 var version string
-var mnt_ns_id uint
 
 func main() {
 	app := &cli.App{
@@ -35,7 +35,6 @@ func main() {
 		Usage:   "Trace OS events and syscalls using eBPF",
 		Version: version,
 		Action: func(c *cli.Context) error {
-
 			if c.Bool("list") {
 				printList()
 				return nil
@@ -47,30 +46,27 @@ func main() {
 			if err != nil {
 				return err
 			}
-			mode, pidsToTrace, err := prepareTraceMode(c.String("trace"))
+			mode, err := prepareTraceMode(c.String("trace"))
 			if err != nil {
 				return err
 			}
-			filter, err := prepareFilter(c.StringSlice("filter"))
-			if err != nil {
-				return err
+			if mode == tracee.ModeMapPinned && c.String("mntns_pin") == "" {
+				return fmt.Errorf("Pinned map mode requires you to pass --mntns_pin parameter")
 			}
 			cfg := tracee.TraceeConfig{
 				EventsToTrace:         events,
 				Mode:                  mode,
-				Filter:                filter,
 				DetectOriginalSyscall: c.Bool("detect-original-syscall"),
 				ShowExecEnv:           c.Bool("show-exec-env"),
 				OutputFormat:          c.String("output"),
 				PerfBufferSize:        c.Int("perf-buffer-size"),
-				PidsToTrace:           pidsToTrace,
 				BlobPerfBufferSize:    c.Int("blob-perf-buffer-size"),
 				OutputPath:            c.String("output-path"),
 				FilterFileWrite:       c.StringSlice("filter-file-write"),
 				SecurityAlerts:        c.Bool("security-alerts"),
 				EventsFile:            os.Stdout,
 				ErrorsFile:            os.Stderr,
-				NSMapPinning:          c.String("mnt_ns_map"),
+				NSMapPinning:          c.String("mntns_pin"),
 			}
 			capture := c.StringSlice("capture")
 			for _, cap := range capture {
@@ -88,6 +84,11 @@ func main() {
 					return fmt.Errorf("invalid capture option: %s", cap)
 				}
 			}
+			filter, err := prepareFilter(c.StringSlice("filter"))
+			if err != nil {
+				return err
+			}
+			cfg.Filter = &filter
 			if c.Bool("security-alerts") {
 				cfg.EventsToTrace = append(cfg.EventsToTrace, tracee.MemProtAlertEventID)
 			}
@@ -102,7 +103,7 @@ func main() {
 			if !checkRequiredCapabilities() {
 				return fmt.Errorf("Insufficient privileges to run")
 			}
-			t, err := tracee.New(cfg, uint32(mnt_ns_id))
+			t, err := tracee.New(cfg)
 			if err != nil {
 				// t is being closed internally
 				return fmt.Errorf("error creating Tracee: %v", err)
@@ -215,15 +216,8 @@ func main() {
 				Value:       "if-needed",
 				Usage:       "when to build the bpf program. possible options: 'never'/'always'/'if-needed'",
 				Destination: &buildPolicy,
-			},
-			&cli.UintFlag{
-				Name:        "mnt_ns_id",
-				Value:       0,
-				Usage:       "Pass mnt_ns_id",
-				Destination: &mnt_ns_id,
-			},
-			&cli.StringFlag{
-				Name:  "mnt_ns_map",
+			}, &cli.StringFlag{
+				Name:  "mntns_pin",
 				Value: "",
 				Usage: "A path to bpf map where the mnt_ns_namespace ids are stored as keys and values are ignored",
 			},
@@ -238,71 +232,246 @@ func main() {
 
 func prepareFilter(filters []string) (tracee.Filter, error) {
 
-	uids := []uint32{}
-
 	filterHelp := "\n--filter allows you to specify values to match on for fields of traced events.\n"
 	filterHelp += "The following options are currently supported:\n"
 	filterHelp += "uid: only trace processes or containers with specified uid(s).\n"
 	filterHelp += "\t--filter uid=0                                                | only trace events from uid 0\n"
 	filterHelp += "\t--filter uid=0,1000                                           | only trace events from uid 0 or uid 1000\n"
 	filterHelp += "\t--filter uid=0 --filter uid=1000                              | only trace events from uid 0 or uid 1000 (same as above)\n"
+	filterHelp += "\t--filter 'uid>0'                                              | only trace events from uids greater than 0"
+	filterHelp += "\t--filter 'uid>0' --filter 'uid<1000'                          | only trace events from uids between 0 and 1000"
+	filterHelp += "\t--filter 'uid>0' --filter uid!=1000                           | only trace events from uids greater than 0 but not 1000"
+	filterHelp += "\n"
+	filterHelp += "pid: only trace processes with specified pids.\n"
+	filterHelp += "\t--filter pid=123                                              | only trace events from pid 123\n"
+	filterHelp += "\t--filter pid!=123                                             | don't trace events from pid 123\n"
+	filterHelp += "\n"
+	filterHelp += "mntns: only trace processes or containers with specified mount namespace(s) ids.\n"
+	filterHelp += "\t--filter mntns=12345678                                       | only trace events from mntns 12345678\n"
+	filterHelp += "\t--filter mntns!=12345678                                      | don't trace events from mntns 12345678\n"
+	filterHelp += "\n"
+	filterHelp += "pidns: only trace processes or containers with specified pid namespace(s) ids.\n"
+	filterHelp += "\t--filter pidns=12345678                                       | only trace events from pidns 12345678\n"
+	filterHelp += "\t--filter pidns!=12345678                                      | don't trace events from pidns 12345678\n"
+	filterHelp += "uts: only trace processes or containers with specified uts namespace(s) name.\n"
+	filterHelp += "\t--filter uts=8215606f23f4                                     | only trace events from uts 8215606f23f4\n"
+	filterHelp += "\t--filter uts!=ab356bc4dd554                                   | don't trace events from uts ab356bc4dd554\n"
+	filterHelp += "comm: only trace processes with specified command name.\n"
+	filterHelp += "\t--filter comm=ls                                              | only trace events from ls command\n"
+	filterHelp += "\t--filter comm!=ls                                             | don't trace events from ls command\n"
 
 	if len(filters) == 1 && filters[0] == "help" {
 		return tracee.Filter{}, fmt.Errorf(filterHelp)
 	}
 
+	filter := tracee.Filter{
+		UIDFilter: &tracee.UintFilter{
+			Equal:    []uint64{},
+			NotEqual: []uint64{},
+			Less:     tracee.LessNotSet,
+			Greater:  tracee.GreaterNotSet,
+			Is32Bit:  true,
+			Enabled:  false,
+		},
+		PIDFilter: &tracee.UintFilter{
+			Equal:    []uint64{},
+			NotEqual: []uint64{},
+			Less:     tracee.LessNotSet,
+			Greater:  tracee.GreaterNotSet,
+			Is32Bit:  true,
+			Enabled:  false,
+		},
+		MntNSFilter: &tracee.UintFilter{
+			Equal:    []uint64{},
+			NotEqual: []uint64{},
+			Less:     tracee.LessNotSet,
+			Greater:  tracee.GreaterNotSet,
+			Is32Bit:  false,
+			Enabled:  false,
+		},
+		PidNSFilter: &tracee.UintFilter{
+			Equal:    []uint64{},
+			NotEqual: []uint64{},
+			Less:     tracee.LessNotSet,
+			Greater:  tracee.GreaterNotSet,
+			Is32Bit:  false,
+			Enabled:  false,
+		},
+		UTSFilter: &tracee.StringFilter{
+			Equal:    []string{},
+			NotEqual: []string{},
+			Enabled:  false,
+		},
+		CommFilter: &tracee.StringFilter{
+			Equal:    []string{},
+			NotEqual: []string{},
+			Enabled:  false,
+		},
+	}
+
 	for _, f := range filters {
-		s := strings.Split(f, "=")
-		if len(s) != 2 {
-			return tracee.Filter{}, fmt.Errorf(filterHelp)
-		}
-		if !validFilterOption(s[0]) {
-			return tracee.Filter{}, fmt.Errorf("invalid filter: %s\n%s", s[0], filterHelp)
-		}
-
-		if s[0] == "uid" {
-			values := strings.Split(s[1], ",")
-			for _, v := range values {
-				uid, err := strconv.ParseUint(v, 10, 32)
-				if err != nil {
-					return tracee.Filter{}, fmt.Errorf("specified invalid uid: %s", v)
-				}
-				uids = append(uids, uint32(uid))
+		if strings.HasPrefix(f, "uid") {
+			err := parseUintFilter(strings.TrimPrefix(f, "uid"), filter.UIDFilter)
+			if err != nil {
+				return tracee.Filter{}, err
 			}
+			continue
+		}
+
+		if strings.HasPrefix(f, "mntns") {
+			err := parseUintFilter(strings.TrimPrefix(f, "mntns"), filter.MntNSFilter)
+			if err != nil {
+				return tracee.Filter{}, err
+			}
+			continue
+		}
+
+		if strings.HasPrefix(f, "pidns") {
+			err := parseUintFilter(strings.TrimPrefix(f, "pidns"), filter.PidNSFilter)
+			if err != nil {
+				return tracee.Filter{}, err
+			}
+			continue
+		}
+
+		if strings.HasPrefix(f, "pid") {
+			err := parseUintFilter(strings.TrimPrefix(f, "pid"), filter.PIDFilter)
+			if err != nil {
+				return tracee.Filter{}, err
+			}
+			continue
+		}
+
+		if strings.HasPrefix(f, "uts") {
+			err := parseStringFilter(strings.TrimPrefix(f, "uts"), filter.UTSFilter)
+			if err != nil {
+				return tracee.Filter{}, err
+			}
+			continue
+		}
+
+		if strings.HasPrefix(f, "comm") {
+			err := parseStringFilter(strings.TrimPrefix(f, "comm"), filter.CommFilter)
+			if err != nil {
+				return tracee.Filter{}, err
+			}
+			continue
+		}
+
+		return tracee.Filter{}, fmt.Errorf("invalid filter option specified, use '--filter help' for more info")
+	}
+
+	return filter, nil
+}
+
+func parseUintFilter(operatorAndValues string, uintFilter *tracee.UintFilter) error {
+	uintFilter.Enabled = true
+	if len(operatorAndValues) < 1 {
+		return fmt.Errorf("invalid operator and/or values given to filter: %s", operatorAndValues)
+	}
+	valuesString := string(operatorAndValues[1:])
+	operatorString := string(operatorAndValues[0])
+
+	if operatorString == "!" {
+		if len(operatorAndValues) < 2 {
+			return fmt.Errorf("invalid operator and/or values given to filter: %s", operatorAndValues)
+		}
+		operatorString = operatorAndValues[0:2]
+		valuesString = operatorAndValues[2:]
+	}
+
+	values := strings.Split(valuesString, ",")
+
+	for i := range values {
+		val, err := strconv.ParseUint(values[i], 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid filter value: %s", values[i])
+		}
+		if uintFilter.Is32Bit && (val > math.MaxUint32) {
+			return fmt.Errorf("filter value is too big: %s", values[i])
+		}
+		switch operatorString {
+		case "=":
+			uintFilter.Equal = append(uintFilter.Equal, val)
+		case "!=":
+			uintFilter.NotEqual = append(uintFilter.NotEqual, val)
+		case ">":
+			if (uintFilter.Greater == tracee.GreaterNotSet) || (val > uintFilter.Greater) {
+				uintFilter.Greater = val
+			}
+		case "<":
+			if (uintFilter.Less == tracee.LessNotSet) || (val < uintFilter.Less) {
+				uintFilter.Less = val
+			}
+		default:
+			return fmt.Errorf("invalid filter operator: %s", operatorString)
 		}
 	}
-	return tracee.Filter{
-		UIDs: uids,
-	}, nil
+
+	return nil
 }
 
-func validFilterOption(s string) bool {
-	validOptions := map[string]bool{
-		"uid": true,
+func parseStringFilter(operatorAndValues string, stringFilter *tracee.StringFilter) error {
+	stringFilter.Enabled = true
+	if len(operatorAndValues) < 1 {
+		return fmt.Errorf("invalid operator and/or values given to filter: %s", operatorAndValues)
 	}
-	return validOptions[s]
+	valuesString := string(operatorAndValues[1:])
+	operatorString := string(operatorAndValues[0])
+
+	if operatorString == "!" {
+		if len(operatorAndValues) < 2 {
+			return fmt.Errorf("invalid operator and/or values given to filter: %s", operatorAndValues)
+		}
+		operatorString = operatorAndValues[0:2]
+		valuesString = operatorAndValues[2:]
+	}
+
+	values := strings.Split(valuesString, ",")
+
+	for i := range values {
+		if len(values[i]) > 16 {
+			return fmt.Errorf("Filtering strings of length bigger than 16 is not supported: %s", values[i])
+		}
+		switch operatorString {
+		case "=":
+			stringFilter.Equal = append(stringFilter.Equal, values[i])
+		case "!=":
+			stringFilter.NotEqual = append(stringFilter.NotEqual, values[i])
+		default:
+			return fmt.Errorf("invalid filter operator: %s", operatorString)
+		}
+	}
+
+	return nil
 }
 
-func prepareTraceMode(traceString string) (uint32, []int, error) {
+func prepareTraceMode(traceString string) (uint32, error) {
 	// Set Default mode - all new Processes only
+	if traceString == "pinned_map" {
+		return tracee.ModeMapPinned, nil
+	}
 	mode := tracee.ModeProcessNew
-	var pidsToTrace []int
 	traceHelp := "\n--trace can be the following options:\n"
 	traceHelp += "'p' or 'process' or 'process:new'            | Trace new processes\n"
 	traceHelp += "'process:all'                                | Trace all processes\n"
 	traceHelp += "'process:<pid>,<pid2>,...' or 'p:<pid>,...'  | Trace specific PIDs\n"
+	traceHelp += "'process:follow'                             | Trace filtered process and all of its children\n"
 	traceHelp += "'c' or 'container' or 'container:new'        | Trace new containers\n"
 	traceHelp += "'container:all'                              | Trace all containers\n"
+	traceHelp += "''h' or 'host' or 'host:new'                 | Trace new processes not in a container\n"
+	traceHelp += "'host:all'                                   | Trace all processes not in a container\n"
+	traceHelp += "'pinned_map'                                 | Trace processes in specific namespaces provided in map, requires valid map pinning passed via --mntns_pin parameter\n"
 	if traceString == "help" {
-		return 0, nil, fmt.Errorf(traceHelp)
+		return 0, fmt.Errorf(traceHelp)
 	}
 
 	traceSplit := strings.Split(traceString, ":")
 
 	// Get The trace type - process or  container
 	traceType := traceSplit[0]
-	if traceType != "process" && traceType != "container" && traceType != "p" && traceType != "c" {
-		return 0, nil, fmt.Errorf(traceHelp)
+	if traceType != "process" && traceType != "container" && traceType != "host" && traceType != "p" && traceType != "c" && traceType != "h" {
+		return 0, fmt.Errorf(traceHelp)
 	}
 	traceType = string(traceType[0])
 
@@ -311,7 +480,7 @@ func prepareTraceMode(traceString string) (uint32, []int, error) {
 	if len(traceSplit) == 2 {
 		traceOption = traceSplit[1]
 	} else if len(traceSplit) > 2 {
-		return 0, nil, fmt.Errorf(traceHelp)
+		return 0, fmt.Errorf(traceHelp)
 	}
 
 	// Convert to Traceing Mode
@@ -320,31 +489,31 @@ func prepareTraceMode(traceString string) (uint32, []int, error) {
 			mode = tracee.ModeProcessAll
 		} else if traceOption == "new" {
 			mode = tracee.ModeProcessNew
-		} else if len(traceOption) != 0 {
-			mode = tracee.ModeProcessList
-			// Attempt to split into PIDs
-			for _, pidString := range strings.Split(traceOption, ",") {
-				pid, err := strconv.ParseInt(pidString, 10, 32)
-				if err != nil {
-					return 0, nil, fmt.Errorf(traceHelp)
-				}
-				pidsToTrace = append(pidsToTrace, int(pid))
-			}
+		} else if traceOption == "follow" {
+			mode = tracee.ModeProcessFollow
 		} else {
 			// Can't have just 'process:'
-			return 0, nil, fmt.Errorf(traceHelp)
+			return 0, fmt.Errorf(traceHelp)
 		}
-	} else {
+	} else if traceType == "c" {
 		if traceOption == "all" {
 			mode = tracee.ModeContainerAll
 		} else if traceOption == "new" {
 			mode = tracee.ModeContainerNew
 		} else {
 			// Containers currently only supports 'new' and 'all'
-			return 0, nil, fmt.Errorf(traceHelp)
+			return 0, fmt.Errorf(traceHelp)
+		}
+	} else {
+		if traceOption == "all" {
+			mode = tracee.ModeHostAll
+		} else if traceOption == "new" {
+			mode = tracee.ModeHostNew
+		} else {
+			return 0, fmt.Errorf(traceHelp)
 		}
 	}
-	return mode, pidsToTrace, nil
+	return mode, nil
 }
 
 func prepareEventsToTrace(eventsToTrace []string, setsToTrace []string, excludeEvents []string) ([]int32, error) {
@@ -416,8 +585,8 @@ func printList() {
 	b.WriteString("System Calls:              Sets:\n")
 	b.WriteString("____________               ____\n\n")
 	for i := 0; i < int(tracee.SysEnterEventID); i++ {
-		event := tracee.EventsIDToEvent[int32(i)]
-		if event.Name == "reserved" {
+		event, ok := tracee.EventsIDToEvent[int32(i)]
+		if !ok {
 			continue
 		}
 		if event.Sets != nil {
@@ -429,7 +598,7 @@ func printList() {
 	}
 	b.WriteString("\n\nOther Events:              Sets:\n")
 	b.WriteString("____________               ____\n\n")
-	for i := int(tracee.SysEnterEventID); i < len(tracee.EventsIDToEvent); i++ {
+	for i := int(tracee.SysEnterEventID); i < int(tracee.MaxEventID); i++ {
 		event := tracee.EventsIDToEvent[int32(i)]
 		if event.Sets != nil {
 			eventSets := fmt.Sprintf("%-23s    %v\n", event.Name, event.Sets)
@@ -464,6 +633,13 @@ func locateFile(file string, dirs []string) string {
 
 // getBPFObject finds or builds ebpf object file and returns it's path
 func getBPFObject() (string, error) {
+	bpfPath, present := os.LookupEnv("TRACEE_BPF_FILE")
+	if present {
+		if _, err := os.Stat(bpfPath); os.IsNotExist(err) {
+			return "", fmt.Errorf("path given in TRACEE_BPF_FILE doesn't exist!")
+		}
+		return bpfPath, nil
+	}
 	bpfObjFileName := fmt.Sprintf("tracee.bpf.%s.%s.o", strings.ReplaceAll(tracee.UnameRelease(), ".", "_"), strings.ReplaceAll(version, ".", "_"))
 	exePath, err := os.Executable()
 	if err != nil {
@@ -471,7 +647,6 @@ func getBPFObject() (string, error) {
 	}
 	//locations to search for the bpf file, in the following order
 	searchPaths := []string{
-		os.Getenv("TRACEE_BPF_FILE"),
 		filepath.Dir(exePath),
 		traceeInstallPath,
 	}
@@ -597,9 +772,21 @@ func makeBPFObject(outFile string) error {
 	}
 	llvmstrip := locateFile("llvm-strip", []string{os.Getenv("LLVM_STRIP")})
 
-	kernelSource := locateFile("", []string{os.Getenv("KERN_SRC"), fmt.Sprintf("/lib/modules/%s/build", tracee.UnameRelease())})
-	if kernelSource == "" {
+	kernelHeaders := locateFile("", []string{os.Getenv("KERN_HEADERS")})
+	kernelBuildPath := locateFile("", []string{fmt.Sprintf("/lib/modules/%s/build", tracee.UnameRelease())})
+	kernelSourcePath := locateFile("", []string{fmt.Sprintf("/lib/modules/%s/source", tracee.UnameRelease())})
+	if kernelHeaders != "" {
+		// In case KERN_HEADERS is set, use it for both source/ and build/
+		kernelBuildPath = kernelHeaders
+		kernelSourcePath = kernelHeaders
+	}
+	if kernelBuildPath == "" {
 		return fmt.Errorf("missing kernel source code compilation dependency")
+	}
+	// In some distros (e.g. debian, suse), kernel headers are split to build/ and source/
+	// while in others (e.g. ubuntu, arch), all headers will be located under build/
+	if kernelSourcePath == "" {
+		kernelSourcePath = kernelBuildPath
 	}
 	linuxArch := os.Getenv("ARCH")
 	if linuxArch == "" {
@@ -612,15 +799,16 @@ func makeBPFObject(outFile string) error {
 	// 	-D__KERNEL__ \
 	// 	-D__TARGET_ARCH_$(linux_arch) \
 	// 	-I $(LIBBPF_HEADERS)/bpf \
-	// 	-include $(KERN_SRC)/include/linux/kconfig.h \
-	// 	-I $(KERN_SRC)/arch/$(linux_arch)/include \
-	// 	-I $(KERN_SRC)/arch/$(linux_arch)/include/uapi \
-	// 	-I $(KERN_SRC)/arch/$(linux_arch)/include/generated \
-	// 	-I $(KERN_SRC)/arch/$(linux_arch)/include/generated/uapi \
-	// 	-I $(KERN_SRC)/include \
-	// 	-I $(KERN_SRC)/include/uapi \
-	// 	-I $(KERN_SRC)/include/generated \
-	// 	-I $(KERN_SRC)/include/generated/uapi \
+	// 	-include $(KERN_SRC_PATH)/include/linux/kconfig.h \
+	// 	-I $(KERN_SRC_PATH)/arch/$(linux_arch)/include \
+	// 	-I $(KERN_SRC_PATH)/arch/$(linux_arch)/include/uapi \
+	// 	-I $(KERN_BLD_PATH)/arch/$(linux_arch)/include/generated \
+	// 	-I $(KERN_BLD_PATH)/arch/$(linux_arch)/include/generated/uapi \
+	// 	-I $(KERN_SRC_PATH)/include \
+	// 	-I $(KERN_BLD_PATH)/include \
+	// 	-I $(KERN_SRC_PATH)/include/uapi \
+	// 	-I $(KERN_BLD_PATH)/include/generated \
+	// 	-I $(KERN_BLD_PATH)/include/generated/uapi \
 	// 	-I $(BPF_HEADERS) \
 	// 	-Wno-address-of-packed-member \
 	// 	-Wno-compare-distinct-pointer-types \
@@ -647,15 +835,16 @@ func makeBPFObject(outFile string) error {
 		"-D__KERNEL__",
 		fmt.Sprintf("-D__TARGET_ARCH_%s", linuxArch),
 		fmt.Sprintf("-I%s", dir),
-		fmt.Sprintf("-include%s/include/linux/kconfig.h", kernelSource),
-		fmt.Sprintf("-I%s/arch/%s/include", kernelSource, linuxArch),
-		fmt.Sprintf("-I%s/arch/%s/include/uapi", kernelSource, linuxArch),
-		fmt.Sprintf("-I%s/arch/%s/include/generated", kernelSource, linuxArch),
-		fmt.Sprintf("-I%s/arch/%s/include/generated/uapi", kernelSource, linuxArch),
-		fmt.Sprintf("-I%s/include", kernelSource),
-		fmt.Sprintf("-I%s/include/uapi", kernelSource),
-		fmt.Sprintf("-I%s/include/generated", kernelSource),
-		fmt.Sprintf("-I%s/include/generated/uapi", kernelSource),
+		fmt.Sprintf("-include%s/include/linux/kconfig.h", kernelSourcePath),
+		fmt.Sprintf("-I%s/arch/%s/include", kernelSourcePath, linuxArch),
+		fmt.Sprintf("-I%s/arch/%s/include/uapi", kernelSourcePath, linuxArch),
+		fmt.Sprintf("-I%s/arch/%s/include/generated", kernelBuildPath, linuxArch),
+		fmt.Sprintf("-I%s/arch/%s/include/generated/uapi", kernelBuildPath, linuxArch),
+		fmt.Sprintf("-I%s/include", kernelSourcePath),
+		fmt.Sprintf("-I%s/include", kernelBuildPath),
+		fmt.Sprintf("-I%s/include/uapi", kernelSourcePath),
+		fmt.Sprintf("-I%s/include/generated", kernelBuildPath),
+		fmt.Sprintf("-I%s/include/generated/uapi", kernelBuildPath),
 		"-Wno-address-of-packed-member",
 		"-Wno-compare-distinct-pointer-types",
 		"-Wno-deprecated-declarations",
@@ -681,7 +870,7 @@ func makeBPFObject(outFile string) error {
 	}
 	err = cmd1.Run()
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed to make BPF object (clang): %v. Try using --debug for more info", err)
 	}
 
 	// from Makefile:
@@ -700,7 +889,7 @@ func makeBPFObject(outFile string) error {
 	}
 	err = cmd2.Run()
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed to make BPF object (llc): %v. Try using --debug for more info", err)
 	}
 
 	// from Makefile:
@@ -717,7 +906,7 @@ func makeBPFObject(outFile string) error {
 		}
 		err = cmd3.Run()
 		if err != nil {
-			return err
+			return fmt.Errorf("Failed to make BPF object (llvm-strip): %v. Try using --debug for more info", err)
 		}
 	}
 

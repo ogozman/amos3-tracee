@@ -33,18 +33,22 @@
 #include <linux/kconfig.h>
 #include <linux/version.h>
 
-
 #undef container_of
 //#include "bpf_core_read.h"
 #include <bpf_helpers.h>
 #include <bpf_tracing.h>
 
+#if defined(bpf_target_x86)
 #define PT_REGS_PARM6(ctx)  ((ctx)->r9)
+#elif defined(bpf_target_arm64)
+#define PT_REGS_PARM6(x) (((PT_REGS_ARM64 *)(x))->regs[5])
+#endif
 
 #define MAX_PERCPU_BUFSIZE  (1 << 15)     // This value is actually set by the kernel as an upper bound
 #define MAX_STRING_SIZE     4096          // Choosing this value to be the same as PATH_MAX
 #define MAX_STR_ARR_ELEM    40            // String array elements number should be bounded due to instructions limit
 #define MAX_PATH_PREF_SIZE  64            // Max path prefix should be bounded due to instructions limit
+#define MAX_STR_FILTER_SIZE 16            // Max string filter size should be bounded due to instructions limit
 
 #define SUBMIT_BUF_IDX      0
 #define STRING_BUF_IDX      1
@@ -83,29 +87,46 @@
 
 #define TAG_NONE           0UL
 
-#define SYS_OPEN            2
-#define SYS_MMAP            9
-#define SYS_MPROTECT        10
-#define SYS_RT_SIGRETURN    15
-#define SYS_CLONE           56
-#define SYS_FORK            57
-#define SYS_VFORK           58
-#define SYS_EXECVE          59
-#define SYS_EXIT            60
-#define SYS_EXIT_GROUP      231
-#define SYS_OPENAT          257
-#define SYS_EXECVEAT        322
-#define RAW_SYS_ENTER       335
-#define RAW_SYS_EXIT        336
-#define DO_EXIT             337
-#define CAP_CAPABLE         338
-#define SECURITY_BPRM_CHECK 339
-#define SECURITY_FILE_OPEN  340
-#define VFS_WRITE           341
-#define VFS_WRITEV          342
-#define MEM_PROT_ALERT      343
-#define SCHED_PROCESS_EXIT  344
-#define MAX_EVENT_ID        345
+#if defined(bpf_target_x86)
+#define SYS_OPEN              2
+#define SYS_MMAP              9
+#define SYS_MPROTECT          10
+#define SYS_RT_SIGRETURN      15
+#define SYS_CLONE             56
+#define SYS_FORK              57
+#define SYS_VFORK             58
+#define SYS_EXECVE            59
+#define SYS_EXIT              60
+#define SYS_EXIT_GROUP        231
+#define SYS_OPENAT            257
+#define SYS_EXECVEAT          322
+#elif defined(bpf_target_arm64)
+#define SYS_OPEN              1000 // undefined in arm64
+#define SYS_MMAP              222
+#define SYS_MPROTECT          226
+#define SYS_RT_SIGRETURN      139
+#define SYS_CLONE             220
+#define SYS_FORK              1000 // undefined in arm64
+#define SYS_VFORK             1000 // undefined in arm64
+#define SYS_EXECVE            221
+#define SYS_EXIT              93
+#define SYS_EXIT_GROUP        94
+#define SYS_OPENAT            56
+#define SYS_EXECVEAT          281
+#endif
+
+#define RAW_SYS_ENTER         1000
+#define RAW_SYS_EXIT          1001
+#define DO_EXIT               1002
+#define CAP_CAPABLE           1003
+#define SECURITY_BPRM_CHECK   1004
+#define SECURITY_FILE_OPEN    1005
+#define SECURITY_INODE_UNLINK 1006
+#define VFS_WRITE             1007
+#define VFS_WRITEV            1008
+#define MEM_PROT_ALERT        1009
+#define SCHED_PROCESS_EXIT    1010
+#define MAX_EVENT_ID          1011
 
 #define CONFIG_MODE             0
 #define CONFIG_SHOW_SYSCALL     1
@@ -113,13 +134,38 @@
 #define CONFIG_CAPTURE_FILES    3
 #define CONFIG_EXTRACT_DYN_CODE 4
 #define CONFIG_TRACEE_PID       5
-#define CONFIG_FILTER_UID       6
+#define CONFIG_UID_FILTER       6
+#define CONFIG_MNT_NS_FILTER    7
+#define CONFIG_PID_NS_FILTER    8
+#define CONFIG_UTS_NS_FILTER    9
+#define CONFIG_COMM_FILTER      10
+#define CONFIG_PID_FILTER       11
+
+
+// get_config(CONFIG_XXX_FILTER) returns 0 if not enabled
+#define FILTER_IN  1
+#define FILTER_OUT 2
+
+#define UID_LESS      0
+#define UID_GREATER   1
+#define PID_LESS      2
+#define PID_GREATER   3
+#define MNTNS_LESS    4
+#define MNTNS_GREATER 5
+#define PIDNS_LESS    6
+#define PIDNS_GREATER 7
+
+#define LESS_NOT_SET    0
+#define GREATER_NOT_SET ULLONG_MAX
 
 #define MODE_PROCESS_ALL        1
 #define MODE_PROCESS_NEW        2
-#define MODE_PROCESS_LIST       3
+#define MODE_PROCESS_FOLLOW     3
 #define MODE_CONTAINER_ALL      4
 #define MODE_CONTAINER_NEW      5
+#define MODE_HOST_ALL           6
+#define MODE_HOST_NEW           7
+#define MODE_MAP_PINNED         8
 
 #define DEV_NULL_STR    0
 
@@ -151,6 +197,12 @@ BPF_MAP(_name, BPF_MAP_TYPE_PROG_ARRAY, u32, u32, _max_entries);
 
 #define BPF_PERF_OUTPUT(_name) \
 BPF_MAP(_name, BPF_MAP_TYPE_PERF_EVENT_ARRAY, int, __u32, 1024);
+
+#ifdef RHEL_RELEASE_CODE
+#if (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(8, 0))
+#define RHEL_RELEASE_GT_8_0
+#endif
+#endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
 #error Minimal required kernel version is 4.14
@@ -199,6 +251,10 @@ typedef struct path_filter {
     char path[MAX_PATH_PREF_SIZE];
 } path_filter_t;
 
+typedef struct string_filter {
+    char str[MAX_STR_FILTER_SIZE];
+} string_filter_t;
+
 typedef struct alert {
     u64 ts;     // Timestamp
     u32 msg;    // Encoded message
@@ -231,10 +287,16 @@ struct mount {
 
 BPF_HASH(config_map, u32, u32);                     // Various configurations
 BPF_HASH(chosen_events_map, u32, u32);              // Events chosen by the user
-BPF_HASH(pids_map, u32, u32);                       // Save container pid namespaces
+BPF_HASH(pids_map, u32, u32);                       // Save traced pids or container pid namespaces ids
 BPF_HASH(args_map, u64, args_t);                    // Persist args info between function entry and return
 BPF_HASH(ret_map, u64, u64);                        // Persist return value to be used in tail calls
-BPF_HASH(uid_filter, u32, u32);                     // Used to filter events by UID                 // Used to filter event by mnt_namespace
+BPF_HASH(inequality_filter, u32, u64);              // Used to filter events by some uint field either by < or >
+BPF_HASH(uid_filter, u32, u32);                     // Used to filter events by UID, for specific UIDs either by == or !=
+BPF_HASH(pid_filter, u32, u32);                     // Used to filter events by PID
+BPF_HASH(mnt_ns_filter, u64, u32);                  // Used to filter events by mount namespace id
+BPF_HASH(pid_ns_filter, u64, u32);                  // Used to filter events by pid namespace id
+BPF_HASH(uts_ns_filter, string_filter_t, u32);      // Used to filter events by uts namespace name
+BPF_HASH(comm_filter, string_filter_t, u32);        // Used to filter events by command name
 BPF_HASH(bin_args_map, u64, bin_args_t);            // Persist args for send_bin funtion
 BPF_HASH(sys_32_to_64_map, u32, u32);               // Map 32bit syscalls numbers to 64bit syscalls numbers
 BPF_HASH(params_types_map, u32, u64);               // Encoded parameters types for event
@@ -247,15 +309,13 @@ BPF_PROG_ARRAY(prog_array, MAX_TAIL_CALL);          // Used to store programs fo
 BPF_PROG_ARRAY(sys_enter_tails, MAX_EVENT_ID);      // Used to store programs for tail calls
 BPF_PROG_ARRAY(sys_exit_tails, MAX_EVENT_ID);       // Used to store programs for tail calls
 
-
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 64);
-	__type(key, u32);
-	__type(value, u32);
+	__uint(max_entries, 128);
+	__type(key, __u64);
+	__type(value, __u32);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} mnt_ns_filter SEC(".maps"); //map where mnt ns ids to filter are stored
-
+} mntns_set SEC(".maps"); //map where mnt ns ids to filter are stored, we use this definition because it allows us to have pinning
 
 /*================================== EVENTS ====================================*/
 
@@ -278,7 +338,7 @@ static __always_inline u32 get_task_ns_pid(struct task_struct *task)
 {
     unsigned int level = READ_KERN(READ_KERN(READ_KERN(task->nsproxy)->pid_ns_for_children)->level);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0) && !defined(RHEL_RELEASE_GT_8_0))
     // kernel 4.14-4.18:
     return READ_KERN(READ_KERN(task->pids[PIDTYPE_PID].pid)->numbers[level].nr);
 #else
@@ -292,7 +352,7 @@ static __always_inline u32 get_task_ns_tgid(struct task_struct *task)
     unsigned int level = READ_KERN(READ_KERN(READ_KERN(task->nsproxy)->pid_ns_for_children)->level);
     struct task_struct *group_leader = READ_KERN(task->group_leader);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0) && !defined(RHEL_RELEASE_GT_8_0))
     // kernel 4.14-4.18:
     return READ_KERN(READ_KERN(group_leader->pids[PIDTYPE_PID].pid)->numbers[level].nr);
 #else
@@ -306,7 +366,7 @@ static __always_inline u32 get_task_ns_ppid(struct task_struct *task)
     struct task_struct *real_parent = READ_KERN(task->real_parent);
     unsigned int level = READ_KERN(READ_KERN(READ_KERN(real_parent->nsproxy)->pid_ns_for_children)->level);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0) && !defined(RHEL_RELEASE_GT_8_0))
     // kernel 4.14-4.18:
     return READ_KERN(READ_KERN(real_parent->pids[PIDTYPE_PID].pid)->numbers[level].nr);
 #else
@@ -327,17 +387,44 @@ static __always_inline u32 get_task_ppid(struct task_struct *task)
 
 static __always_inline bool is_x86_compat(struct task_struct *task)
 {
+#if defined(bpf_target_x86)
     return READ_KERN(task->thread_info.status) & TS_COMPAT;
+#else
+    return false;
+#endif
 }
 
+static __always_inline bool is_arm64_compat(struct task_struct *task)
+{
+#if defined(bpf_target_arm64)
+    return READ_KERN(task->thread_info.flags) & _TIF_32BIT;
+#else
+    return false;
+#endif
+}
+
+static __always_inline bool is_compat(struct task_struct *task)
+{
+#if defined(bpf_target_x86)
+    return is_x86_compat(task);
+#elif defined(bpf_target_arm64)
+    return is_arm64_compat(task);
+#else
+    return false;
+#endif
+}
+
+#if defined(bpf_target_x86)
 static __always_inline struct pt_regs* get_task_pt_regs(struct task_struct *task)
 {
     void* __ptr = READ_KERN(task->stack) + THREAD_SIZE - TOP_OF_KERNEL_STACK_PADDING;
     return ((struct pt_regs *)__ptr) - 1;
 }
+#endif
 
 static __always_inline int get_syscall_ev_id_from_regs()
 {
+#if defined(bpf_target_x86)
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     struct pt_regs *real_ctx = get_task_pt_regs(task);
     int syscall_nr = READ_KERN(real_ctx->orig_ax);
@@ -352,6 +439,9 @@ static __always_inline int get_syscall_ev_id_from_regs()
     }
 
     return syscall_nr;
+#else
+    return 0;
+#endif
 }
 
 static __always_inline struct dentry* get_mnt_root_ptr_from_vfsmnt(struct vfsmount *vfsmnt)
@@ -422,170 +512,6 @@ static __inline int has_prefix(char *prefix, char *str, int n)
     return 0;
 }
 
-static __always_inline u32 lookup_pid()
-{
-    u32 pid = bpf_get_current_pid_tgid();
-    if (bpf_map_lookup_elem(&pids_map, &pid) == 0)
-        return 0;
-
-    return pid;
-}
-
-static __always_inline u32 lookup_pid_ns(struct task_struct *task)
-{
-    u32 task_pid_ns = get_task_pid_ns_id(task);
-
-    u32 *pid_ns = bpf_map_lookup_elem(&pids_map, &task_pid_ns);
-    if (pid_ns == 0)
-        return 0;
-
-    return *pid_ns;
-}
-
-static __always_inline void add_pid_fork(u32 pid)
-{
-    bpf_map_update_elem(&pids_map, &pid, &pid, BPF_ANY);
-}
-
-static __always_inline u32 add_pid()
-{
-    u32 pid = bpf_get_current_pid_tgid();
-    if (bpf_map_lookup_elem(&pids_map, &pid) == 0)
-        bpf_map_update_elem(&pids_map, &pid, &pid, BPF_ANY);
-
-    return pid;
-}
-
-static __always_inline u32 add_pid_ns_if_needed()
-{
-    struct task_struct *task;
-    task = (struct task_struct *)bpf_get_current_task();
-
-    u32 pid_ns = get_task_pid_ns_id(task);
-    if (bpf_map_lookup_elem(&pids_map, &pid_ns) != 0)
-        // Container pidns was already added to map
-        return pid_ns;
-
-    // If pid equals 1 - start tracing the container
-    if (get_task_ns_pid(task) == 1) {
-        // A new container/pod was started - add pid namespace to map
-        bpf_map_update_elem(&pids_map, &pid_ns, &pid_ns, BPF_ANY);
-        return pid_ns;
-    }
-
-    // Not a container/pod
-    return 0;
-}
-
-static __always_inline void remove_pid()
-{
-    u32 pid = bpf_get_current_pid_tgid();
-    if (bpf_map_lookup_elem(&pids_map, &pid) != 0)
-        bpf_map_delete_elem(&pids_map, &pid);
-}
-
-static __always_inline void remove_pid_ns_if_needed()
-{
-    struct task_struct *task;
-    task = (struct task_struct *)bpf_get_current_task();
-
-    u32 pid_ns = get_task_pid_ns_id(task);
-    if (bpf_map_lookup_elem(&pids_map, &pid_ns) != 0) {
-        // If pid equals 1 - stop tracing this pid namespace
-        if (get_task_ns_pid(task) == 1) {
-            bpf_map_delete_elem(&pids_map, &pid_ns);
-        }
-    }
-}
-
-static __always_inline int get_config(u32 key)
-{
-    u32 *config = bpf_map_lookup_elem(&config_map, &key);
-
-    if (config == NULL)
-        return 0;
-
-    return *config;
-}
-
-static __always_inline int uid_filter_matches()
-{
-    uid_t uid = (u32)bpf_get_current_uid_gid();
-    u32* isMatch = bpf_map_lookup_elem(&uid_filter, &uid);
-    if (isMatch == NULL) {
-        return 0;
-    }
-    return 1;
-}
-
-static __always_inline int mnt_id_filter_matches(u32 mnt_id)
-{
-    u32 turn_off_flag = 0; 
-    u32* useFilter = bpf_map_lookup_elem(&mnt_ns_filter, &turn_off_flag);
-    if (useFilter != NULL) {
-        return 1;
-    }
-    uid_t mnt_id_curr = mnt_id;
-    u32* isMatch = bpf_map_lookup_elem(&mnt_ns_filter, &mnt_id_curr);
-    if (isMatch == NULL) {
-        return 0;
-    }
-    return 1;
-}
-
-static __always_inline int should_trace()
-{
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-
-    int config_mode = get_config(CONFIG_MODE);
-    u32 rc = 0;
-    u32 host_pid = bpf_get_current_pid_tgid() >> 32;
-    u32 mnt_id = get_task_mnt_ns_id(task);
-    if (!mnt_id_filter_matches(mnt_id)) {
-        //bpf_printk("This is our mnit_id %u", mnt_id);
-        return 0;
-    }
-    //bpf_printk("This is our mnit_id %u", mnt_id);
-    if (get_config(CONFIG_TRACEE_PID) == host_pid) {
-        return 0;
-    }
-
-    if (get_config(CONFIG_FILTER_UID) > 0) {
-        if (!uid_filter_matches())
-        {
-            return 0; 
-        }
-    }
-
-
-    // All logs all processes except tracee itself
-    if (config_mode == MODE_PROCESS_ALL)
-        return 1;
-    else if (config_mode == MODE_CONTAINER_NEW)
-        rc = lookup_pid_ns(task);
-    else if (config_mode == MODE_PROCESS_NEW || config_mode == MODE_PROCESS_LIST)
-        rc = lookup_pid();
-    else if (config_mode == MODE_CONTAINER_ALL) {
-        // 'Container-All' means anything in a container
-        // We can check if we're in a namespace by checking
-        // our PID Vs 'real' PID on host
-        if (get_task_ns_tgid(task) != host_pid) {
-            return 1;
-        }
-    }
-
-    return rc;
-}
-
-static __always_inline int event_chosen(u32 key)
-{
-    u32 *config = bpf_map_lookup_elem(&chosen_events_map, &key);
-    if (config == NULL)
-        return 0;
-
-    return *config;
-}
-
 static __always_inline int init_context(context_t *context)
 {
     struct task_struct *task;
@@ -610,6 +536,178 @@ static __always_inline int init_context(context_t *context)
     context->ts = bpf_ktime_get_ns()/1000;
 
     return 0;
+}
+
+static __always_inline int get_config(u32 key)
+{
+    u32 *config = bpf_map_lookup_elem(&config_map, &key);
+
+    if (config == NULL)
+        return 0;
+
+    return *config;
+}
+
+// returns 1 if you should trace based on uid, 0 if not
+static __always_inline int uint_filter_matches(int filter_config, void *filter_map, u64 key, u32 less_idx, u32 greater_idx)
+{
+    int config = get_config(filter_config);
+    if (!config)
+        return 1;
+
+    u8* equality = bpf_map_lookup_elem(filter_map, &key);
+    if (equality != NULL) {
+        return *equality;
+    }
+
+    if (config == FILTER_IN)
+        return 0;
+
+    u64* lessThan = bpf_map_lookup_elem(&inequality_filter, &less_idx);
+    if (lessThan == NULL)
+        return 1;
+
+    if ((*lessThan != LESS_NOT_SET) && (key >= *lessThan)) {
+        return 0;
+    }
+
+    u64* greaterThan = bpf_map_lookup_elem(&inequality_filter, &greater_idx);
+    if (greaterThan == NULL)
+        return 1;
+
+    if ((*greaterThan != GREATER_NOT_SET) && (key <= *greaterThan)) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static __always_inline int equality_filter_matches(int filter_config, void *filter_map, void *key)
+{
+    int config = get_config(filter_config);
+    if (!config)
+        return 1;
+
+    u32* equality = bpf_map_lookup_elem(filter_map, key);
+    if (equality != NULL) {
+        return *equality;
+    }
+
+    if (config == FILTER_IN)
+        return 0;
+
+    return 1;
+}
+
+static __always_inline int mnt_id_filter_matches(u32 mnt_id)
+{
+    u64 mnt_id_curr = (u64)mnt_id;
+    uid_t* isMatch = bpf_map_lookup_elem(&mntns_set, &mnt_id_curr); 
+    if (isMatch == NULL) {      
+        return 0;    
+   }
+   bpf_printk("\nWe passed\n");
+    return 1;
+}
+
+static __always_inline int should_trace()
+{
+    context_t context = {};
+    init_context(&context);
+ 
+
+   // if (!mnt_id_filter_matches(context.mnt_id)) {
+   //     return 0;
+   // }
+
+    
+    switch (get_config(CONFIG_MODE))
+    {
+        case MODE_MAP_PINNED:
+            //bpf_printk("\nYes we are here\n");
+            if (mnt_id_filter_matches(context.mnt_id)) {
+                return 1;
+            } else {
+                return 0;
+            }
+        case MODE_PROCESS_NEW:
+            if (bpf_map_lookup_elem(&pids_map, &context.host_tid) == 0)
+                return 0;
+            break;
+        case MODE_PROCESS_FOLLOW:
+            if (bpf_map_lookup_elem(&pids_map, &context.host_tid) != 0) {
+                return 1;
+            }
+            break;
+        case MODE_CONTAINER_NEW:
+            if (bpf_map_lookup_elem(&pids_map, &context.pid_id) == 0)
+                return 0;
+            break;
+        case MODE_CONTAINER_ALL:
+            if (context.tid == context.host_tid) {
+                return 0;
+            }
+            break;
+        case MODE_HOST_ALL:
+            if (context.tid != context.host_tid) {
+                return 0;
+            }
+            break;
+        case MODE_HOST_NEW:
+            if ((context.tid != context.host_tid) || (bpf_map_lookup_elem(&pids_map, &context.host_tid) == 0)) {
+                return 0;
+            }
+            break;
+    }
+
+    // Don't monitor self
+    if (get_config(CONFIG_TRACEE_PID) == context.host_pid) {
+        return 0;
+    }
+
+    if (!uint_filter_matches(CONFIG_UID_FILTER, &uid_filter, context.uid, UID_LESS, UID_GREATER))
+    {
+        return 0; 
+    }
+
+    if (!uint_filter_matches(CONFIG_MNT_NS_FILTER, &mnt_ns_filter, context.mnt_id, MNTNS_LESS, MNTNS_GREATER))
+    {
+        return 0;
+    }
+
+    if (!uint_filter_matches(CONFIG_PID_NS_FILTER, &pid_ns_filter, context.pid_id, PIDNS_LESS, PIDNS_GREATER))
+    {
+        return 0;
+    }
+
+    if (!uint_filter_matches(CONFIG_PID_FILTER, &pid_filter, context.host_tid, PID_LESS, PID_GREATER))
+    {
+        return 0;
+    }
+
+    if (!equality_filter_matches(CONFIG_UTS_NS_FILTER, &uts_ns_filter, &context.uts_name))
+    {
+        return 0;
+    }
+
+    if (!equality_filter_matches(CONFIG_COMM_FILTER, &comm_filter, &context.comm))
+    {
+        return 0;
+    }
+    
+     // We passed all filters successfully
+    return 1;
+
+    
+}
+
+static __always_inline int event_chosen(u32 key)
+{
+    u32 *config = bpf_map_lookup_elem(&chosen_events_map, &key);
+    if (config == NULL)
+        return 0;
+
+    return *config;
 }
 
 static __always_inline buf_t* get_buf(int idx)
@@ -901,6 +999,60 @@ static __always_inline int save_file_path_to_str_buf(buf_t *string_p, struct fil
     return buf_off;
 }
 
+static __always_inline int save_dentry_path_to_str_buf(buf_t *string_p, struct dentry* dentry)
+{
+    char slash = '/';
+    int zero = 0;
+
+    u32 buf_off = (MAX_PERCPU_BUFSIZE >> 1);
+
+    #pragma unroll
+    // As bpf loops are not allowed and max instructions number is 4096, path components is limited to 30
+    for (int i = 0; i < 30; i++) {
+        struct dentry *d_parent = get_d_parent_ptr_from_dentry(dentry);
+        if (dentry == d_parent) {
+            break;
+        }
+        // Add this dentry name to path
+        struct qstr d_name = get_d_name_from_dentry(dentry);
+        unsigned int len = (d_name.len+1) & (MAX_STRING_SIZE-1);
+        unsigned int off = buf_off - len;
+        // Is string buffer big enough for dentry name?
+        int sz = 0;
+        if (off <= buf_off) { // verify no wrap occured
+            len = ((len - 1) & ((MAX_PERCPU_BUFSIZE >> 1)-1)) + 1;
+            sz = bpf_probe_read_str(&(string_p->buf[off & ((MAX_PERCPU_BUFSIZE >> 1)-1)]), len, (void *)d_name.name);
+        }
+        else
+            break;
+        if (sz > 1) {
+            buf_off -= 1; // remove null byte termination with slash sign
+            bpf_probe_read(&(string_p->buf[buf_off & (MAX_PERCPU_BUFSIZE-1)]), 1, &slash);
+            buf_off -= sz - 1;
+        } else {
+            // If sz is 0 or 1 we have an error (path can't be null nor an empty string)
+            break;
+        }
+        dentry = d_parent;
+    }
+
+    if (buf_off == (MAX_PERCPU_BUFSIZE >> 1)) {
+        // memfd files have no path in the filesystem -> extract their name
+        buf_off = 0;
+        struct qstr d_name = get_d_name_from_dentry(dentry);
+        bpf_probe_read_str(&(string_p->buf[0]), MAX_STRING_SIZE, (void *)d_name.name);
+    } else {
+        // Add leading slash
+        buf_off -= 1;
+        bpf_probe_read(&(string_p->buf[buf_off & (MAX_PERCPU_BUFSIZE-1)]), 1, &slash);
+        // Null terminate the path string
+        bpf_probe_read(&(string_p->buf[(MAX_PERCPU_BUFSIZE >> 1)-1]), 1, &zero);
+    }
+
+    set_buf_off(STRING_BUF_IDX, buf_off);
+    return buf_off;
+}
+
 static __always_inline int events_perf_submit(void *ctx)
 {
     u32* off = get_buf_off(SUBMIT_BUF_IDX);
@@ -914,14 +1066,6 @@ static __always_inline int events_perf_submit(void *ctx)
     int size = ((*off - 1) & (MAX_PERCPU_BUFSIZE-1)) + 1;
     void * data = submit_p->buf;
     return bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, data, size);
-}
-
-static __always_inline int is_container()
-{
-    struct task_struct *task;
-    task = (struct task_struct *)bpf_get_current_task();
-
-    return lookup_pid_ns(task);
 }
 
 static __always_inline int save_args(args_t *args, u32 event_id)
@@ -940,12 +1084,14 @@ static __always_inline int save_args_from_regs(struct pt_regs *ctx, u32 event_id
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     if (is_x86_compat(task) && is_syscall) {
+#if defined(bpf_target_x86)
         args.args[0] = ctx->bx;
         args.args[1] = ctx->cx;
         args.args[2] = ctx->dx;
         args.args[3] = ctx->si;
         args.args[4] = ctx->di;
         args.args[5] = ctx->bp;
+#endif
     } else {
         args.args[0] = PT_REGS_PARM1(ctx);
         args.args[1] = PT_REGS_PARM2(ctx);
@@ -1185,34 +1331,54 @@ struct bpf_raw_tracepoint_args *ctx
 #endif
 )
 {
-    struct pt_regs regs = {};
+    args_t args_tmp = {};
     int id;
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)
     void *ctx = args;
-    if (!is_x86_compat(task)) {
-        regs.di = args->args[0];
-        regs.si = args->args[1];
-        regs.dx = args->args[2];
-        regs.r10 = args->args[3];
-        regs.r8 = args->args[4];
-        regs.r9 = args->args[5];
-    } else {
-        regs.bx = args->args[0];
-        regs.cx = args->args[1];
-        regs.dx = args->args[2];
-        regs.si = args->args[3];
-        regs.di = args->args[4];
-        regs.bp = args->args[5];
-    }
     id = args->id;
-#else
-    bpf_probe_read(&regs, sizeof(struct pt_regs), (void*)ctx->args[0]);
+
+    args_tmp.args[0] = args->args[0];
+    args_tmp.args[1] = args->args[1];
+    args_tmp.args[2] = args->args[2];
+    args_tmp.args[3] = args->args[3];
+    args_tmp.args[4] = args->args[4];
+    args_tmp.args[5] = args->args[5];
+#else // LINUX_VERSION_CODE
     id = ctx->args[1];
-#endif
+#if defined(CONFIG_ARCH_HAS_SYSCALL_WRAPPER)
+    struct pt_regs regs = {};
+    bpf_probe_read(&regs, sizeof(struct pt_regs), (void*)ctx->args[0]);
 
     if (is_x86_compat(task)) {
+#if defined(bpf_target_x86)
+        args_tmp.args[0] = regs.bx;
+        args_tmp.args[1] = regs.cx;
+        args_tmp.args[2] = regs.dx;
+        args_tmp.args[3] = regs.si;
+        args_tmp.args[4] = regs.di;
+        args_tmp.args[5] = regs.bp;
+#endif // bpf_target_x86
+    } else {
+        args_tmp.args[0] = PT_REGS_PARM1(&regs);
+        args_tmp.args[1] = PT_REGS_PARM2(&regs);
+        args_tmp.args[2] = PT_REGS_PARM3(&regs);
+        args_tmp.args[3] = PT_REGS_PARM4(&regs);
+        args_tmp.args[4] = PT_REGS_PARM5(&regs);
+        args_tmp.args[5] = PT_REGS_PARM6(&regs);
+    }
+#else // CONFIG_ARCH_HAS_SYSCALL_WRAPPER
+    args_tmp.args[0] = ctx->args[0];
+    args_tmp.args[1] = ctx->args[1];
+    args_tmp.args[2] = ctx->args[2];
+    args_tmp.args[3] = ctx->args[3];
+    args_tmp.args[4] = ctx->args[4];
+    args_tmp.args[5] = ctx->args[5];
+#endif // CONFIG_ARCH_HAS_SYSCALL_WRAPPER
+#endif // LINUX_VERSION_CODE
+
+    if (is_compat(task)) {
         // Translate 32bit syscalls to 64bit syscalls so we can send to the correct handler
         u32 *id_64 = bpf_map_lookup_elem(&sys_32_to_64_map, &id);
         if (id_64 == 0)
@@ -1220,20 +1386,32 @@ struct bpf_raw_tracepoint_args *ctx
 
         id = *id_64;
     }
+    int config_mode = get_config(CONFIG_MODE);
+    u32 pid = bpf_get_current_pid_tgid();
 
     // execve events may add new pids to the traced pids set
     // perform this check before should_trace() so newly executed binaries will be traced
     if (id == SYS_EXECVE || id == SYS_EXECVEAT) {
-        int config_mode = get_config(CONFIG_MODE);
         if (config_mode == MODE_CONTAINER_NEW) {
-            add_pid_ns_if_needed();
-        } else if (config_mode == MODE_PROCESS_NEW || config_mode == MODE_PROCESS_ALL) {
-            add_pid();
+            u32 pid_ns = get_task_pid_ns_id(task);
+            if ((bpf_map_lookup_elem(&pids_map, &pid_ns) == 0) && (get_task_ns_pid(task) == 1)) {
+                // A new container/pod was started (pid 1 in namespace executed) - add pid namespace to map
+                bpf_map_update_elem(&pids_map, &pid_ns, &pid_ns, BPF_ANY);
+            }
+        } else if (config_mode == MODE_PROCESS_NEW || config_mode == MODE_PROCESS_ALL || config_mode == MODE_HOST_ALL || config_mode == MODE_HOST_NEW) {
+            if (bpf_map_lookup_elem(&pids_map, &pid) == 0)
+                bpf_map_update_elem(&pids_map, &pid, &pid, BPF_ANY);
         }
     }
-
+    
     if (!should_trace())
         return 0;
+
+    if ((id == SYS_EXECVE || id == SYS_EXECVEAT) && (config_mode == MODE_PROCESS_FOLLOW))
+    {
+        // We passed all filters (in should_trace()) - add this pid to traced pids set
+        bpf_map_update_elem(&pids_map, &pid, &pid, BPF_ANY);
+    }
 
     if (event_chosen(RAW_SYS_ENTER)) {
         buf_t *submit_p = get_buf(SUBMIT_BUF_IDX);
@@ -1254,7 +1432,7 @@ struct bpf_raw_tracepoint_args *ctx
 
     // exit, exit_group and rt_sigreturn syscalls don't return - don't save args for them
     if (id != SYS_EXIT && id != SYS_EXIT_GROUP && id != SYS_RT_SIGRETURN) {
-        save_args_from_regs(&regs, id, true);
+        save_args(&args_tmp, id);
     }
 
     // call syscall handler, if exists
@@ -1294,7 +1472,7 @@ struct bpf_raw_tracepoint_args *ctx
     ret = ctx->args[1];
 #endif
 
-    if (is_x86_compat(task)) {
+    if (is_compat(task)) {
         // Translate 32bit syscalls to 64bit syscalls so we can send to the correct handler
         u32 *id_64 = bpf_map_lookup_elem(&sys_32_to_64_map, &id);
         if (id_64 == 0)
@@ -1316,7 +1494,7 @@ struct bpf_raw_tracepoint_args *ctx
     if (id == SYS_CLONE || id == SYS_FORK || id == SYS_VFORK) {
         if (get_config(CONFIG_MODE) != MODE_CONTAINER_ALL && get_config(CONFIG_MODE) != MODE_CONTAINER_NEW) {
             u32 pid = ret;
-            add_pid_fork(pid);
+            bpf_map_update_elem(&pids_map, &pid, &pid, BPF_ANY);
         }
     }
 
@@ -1375,6 +1553,7 @@ SEC("raw_tracepoint/sys_execve")
 int syscall__execve(void *ctx)
 {
     args_t args = {};
+    u8 argnum = 0;
 
     bool delete_args = false;
     if (load_args(&args, delete_args, SYS_EXECVE) != 0)
@@ -1395,14 +1574,14 @@ int syscall__execve(void *ctx)
         return -1;
     }
 
-    save_str_to_buf(submit_p, (void *)args.args[0] /*filename*/, DEC_ARG(0, *tags));
-    save_str_arr_to_buf(submit_p, (const char *const *)args.args[1] /*argv*/, DEC_ARG(1, *tags));
+    argnum += save_str_to_buf(submit_p, (void *)args.args[0] /*filename*/, DEC_ARG(0, *tags));
+    argnum += save_str_arr_to_buf(submit_p, (const char *const *)args.args[1] /*argv*/, DEC_ARG(1, *tags));
     if (get_config(CONFIG_EXEC_ENV)) {
-        context.argnum++;
-        save_context_to_buf(submit_p, (void*)&context);
-        save_str_arr_to_buf(submit_p, (const char *const *)args.args[2] /*envp*/, DEC_ARG(2, *tags));
+        argnum += save_str_arr_to_buf(submit_p, (const char *const *)args.args[2] /*envp*/, DEC_ARG(2, *tags));
     }
 
+    context.argnum = argnum;
+    save_context_to_buf(submit_p, (void*)&context);
     events_perf_submit(ctx);
     return 0;
 }
@@ -1411,6 +1590,7 @@ SEC("raw_tracepoint/sys_execveat")
 int syscall__execveat(void *ctx)
 {
     args_t args = {};
+    u8 argnum = 0;
 
     bool delete_args = false;
     if (load_args(&args, delete_args, SYS_EXECVEAT) != 0)
@@ -1431,16 +1611,16 @@ int syscall__execveat(void *ctx)
         return -1;
     }
 
-    save_to_submit_buf(submit_p, (void*)&args.args[0] /*dirfd*/, sizeof(int), INT_T, DEC_ARG(0, *tags));
-    save_str_to_buf(submit_p, (void *)args.args[1] /*pathname*/, DEC_ARG(1, *tags));
-    save_str_arr_to_buf(submit_p, (const char *const *)args.args[2] /*argv*/, DEC_ARG(2, *tags));
+    argnum += save_to_submit_buf(submit_p, (void*)&args.args[0] /*dirfd*/, sizeof(int), INT_T, DEC_ARG(0, *tags));
+    argnum += save_str_to_buf(submit_p, (void *)args.args[1] /*pathname*/, DEC_ARG(1, *tags));
+    argnum += save_str_arr_to_buf(submit_p, (const char *const *)args.args[2] /*argv*/, DEC_ARG(2, *tags));
     if (get_config(CONFIG_EXEC_ENV)) {
-        context.argnum++;
-        save_context_to_buf(submit_p, (void*)&context);
-        save_str_arr_to_buf(submit_p, (const char *const *)args.args[3] /*envp*/, DEC_ARG(3, *tags));
+        argnum += save_str_arr_to_buf(submit_p, (const char *const *)args.args[3] /*envp*/, DEC_ARG(3, *tags));
     }
-    save_to_submit_buf(submit_p, (void*)&args.args[4] /*flags*/, sizeof(int), INT_T, DEC_ARG(4, *tags));
+    argnum += save_to_submit_buf(submit_p, (void*)&args.args[4] /*flags*/, sizeof(int), INT_T, DEC_ARG(4, *tags));
 
+    context.argnum = argnum;
+    save_context_to_buf(submit_p, (void*)&context);
     events_perf_submit(ctx);
     return 0;
 }
@@ -1459,10 +1639,22 @@ struct bpf_raw_tracepoint_args *ctx
     if (!should_trace())
         return 0;
 
-    if (get_config(CONFIG_MODE) == MODE_CONTAINER_NEW)
-        remove_pid_ns_if_needed();
-    else
-        remove_pid();
+    if (get_config(CONFIG_MODE) == MODE_CONTAINER_NEW) {
+        struct task_struct *task;
+        task = (struct task_struct *)bpf_get_current_task();
+
+        u32 pid_ns = get_task_pid_ns_id(task);
+        if ((bpf_map_lookup_elem(&pids_map, &pid_ns) != 0) && (get_task_ns_pid(task) == 1)) {
+            // If pid equals 1 - stop tracing this pid namespace
+            bpf_map_delete_elem(&pids_map, &pid_ns);
+        }
+    }
+    else {
+        // Remove pid from pids_map
+        u32 pid = bpf_get_current_pid_tgid();
+        if (bpf_map_lookup_elem(&pids_map, &pid) != 0)
+            bpf_map_delete_elem(&pids_map, &pid);
+    }
 
     buf_t *submit_p = get_buf(SUBMIT_BUF_IDX);
     if (submit_p == NULL)
@@ -1574,6 +1766,42 @@ int BPF_KPROBE(trace_security_file_open)
     save_to_submit_buf(submit_p, (void*)&file->f_flags, sizeof(int), INT_T, DEC_ARG(1, *tags));
     save_to_submit_buf(submit_p, &s_dev, sizeof(dev_t), DEV_T_T, DEC_ARG(2, *tags));
     save_to_submit_buf(submit_p, &inode_nr, sizeof(unsigned long), ULONG_T, DEC_ARG(3, *tags));
+
+    events_perf_submit(ctx);
+    return 0;
+}
+
+SEC("kprobe/security_inode_unlink")
+int BPF_KPROBE(trace_security_inode_unlink)
+{
+    if (!should_trace())
+        return 0;
+
+    buf_t *submit_p = get_buf(SUBMIT_BUF_IDX);
+    if (submit_p == NULL)
+        return 0;
+    set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
+
+    context_t context = init_and_save_context(submit_p, SECURITY_INODE_UNLINK, 1 /*argnum*/, 0 /*ret*/);
+
+    //struct inode *dir = (struct inode *)PT_REGS_PARM1(ctx);
+    struct dentry *dentry = (struct dentry *)PT_REGS_PARM2(ctx);
+
+    // Get per-cpu string buffer
+    buf_t *string_p = get_buf(STRING_BUF_IDX);
+    if (string_p == NULL)
+        return -1;
+    save_dentry_path_to_str_buf(string_p, dentry);
+    u32 *off = get_buf_off(STRING_BUF_IDX);
+    if (off == NULL)
+        return -1;
+
+    u64 *tags = bpf_map_lookup_elem(&params_names_map, &context.eventid);
+    if (!tags) {
+        return -1;
+    }
+
+    save_str_to_buf(submit_p, (void *)&string_p->buf[*off], DEC_ARG(0, *tags));
 
     events_perf_submit(ctx);
     return 0;

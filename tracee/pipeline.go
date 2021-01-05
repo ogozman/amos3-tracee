@@ -78,7 +78,6 @@ func (t *Tracee) decodeRawEvent(done <-chan struct{}) (<-chan RawEvent, <-chan e
 			}
 		}
 	}()
-
 	return out, errc, nil
 }
 
