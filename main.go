@@ -39,61 +39,38 @@ func main() {
 				printList()
 				return nil
 			}
-			if c.IsSet("event") && c.IsSet("exclude-event") {
-				return fmt.Errorf("'event' and 'exclude-event' can't be used in parallel")
-			}
-			events, err := prepareEventsToTrace(c.StringSlice("event"), c.StringSlice("events-set"), c.StringSlice("exclude-event"))
-			if err != nil {
-				return err
-			}
-			mode, err := prepareTraceMode(c.String("trace"))
-			if err != nil {
-				return err
-			}
-			if mode == tracee.ModeMapPinned && c.String("mntns_pin") == "" {
-				return fmt.Errorf("Pinned map mode requires you to pass --mntns_pin parameter")
-			}
+
 			cfg := tracee.TraceeConfig{
-				EventsToTrace:         events,
-				Mode:                  mode,
 				DetectOriginalSyscall: c.Bool("detect-original-syscall"),
 				ShowExecEnv:           c.Bool("show-exec-env"),
 				OutputFormat:          c.String("output"),
 				PerfBufferSize:        c.Int("perf-buffer-size"),
 				BlobPerfBufferSize:    c.Int("blob-perf-buffer-size"),
-				OutputPath:            c.String("output-path"),
-				FilterFileWrite:       c.StringSlice("filter-file-write"),
 				SecurityAlerts:        c.Bool("security-alerts"),
 				EventsFile:            os.Stdout,
 				ErrorsFile:            os.Stderr,
-				NSMapPinning:          c.String("mntns_pin"),
+				StackAddresses:        c.Bool("stack-addresses"),
 			}
-			capture := c.StringSlice("capture")
-			for _, cap := range capture {
-				if cap == "write" {
-					cfg.CaptureWrite = true
-				} else if cap == "exec" {
-					cfg.CaptureExec = true
-				} else if cap == "mem" {
-					cfg.CaptureMem = true
-				} else if cap == "all" {
-					cfg.CaptureWrite = true
-					cfg.CaptureExec = true
-					cfg.CaptureMem = true
-				} else {
-					return fmt.Errorf("invalid capture option: %s", cap)
-				}
+			pinObject, objectName, path, err := preparePinning(c.String("pin"))
+			if err != nil {
+				return err
 			}
-			filter, err := prepareFilter(c.StringSlice("filter"))
+			cfg.PinObjectType = pinObject
+			cfg.PinPath = path
+			cfg.PinObjectName = objectName
+			capture, err := prepareCapture(c.StringSlice("capture"))
+			if err != nil {
+				return err
+			}
+			cfg.Capture = &capture
+			filter, err := prepareFilter(c.StringSlice("trace"))
 			if err != nil {
 				return err
 			}
 			cfg.Filter = &filter
+
 			if c.Bool("security-alerts") {
-				cfg.EventsToTrace = append(cfg.EventsToTrace, tracee.MemProtAlertEventID)
-			}
-			if c.Bool("clear-output-path") {
-				os.RemoveAll(cfg.OutputPath)
+				cfg.Filter.EventsToTrace = append(cfg.Filter.EventsToTrace, tracee.MemProtAlertEventID)
 			}
 			bpfFile, err := getBPFObject()
 			if err != nil {
@@ -111,46 +88,23 @@ func main() {
 			return t.Run()
 		},
 		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:    "output",
-				Aliases: []string{"o"},
-				Value:   "table",
-				Usage:   "output format: table/table-verbose/json/gob/go-template=<path>",
-			},
-			&cli.StringSliceFlag{
-				Name:    "event",
-				Aliases: []string{"e"},
-				Value:   nil,
-				Usage:   "trace only the specified event or syscall. use this flag multiple times to choose multiple events",
-			},
-			&cli.StringSliceFlag{
-				Name:    "events-set",
-				Aliases: []string{"s"},
-				Value:   nil,
-				Usage:   "trace all the events which belong to this set. use this flag multiple times to choose multiple sets",
-			},
-			&cli.StringSliceFlag{
-				Name:  "exclude-event",
-				Value: nil,
-				Usage: "exclude an event from being traced. use this flag multiple times to choose multiple events to exclude",
-			},
 			&cli.BoolFlag{
 				Name:    "list",
 				Aliases: []string{"l"},
 				Value:   false,
 				Usage:   "just list tracable events",
 			},
-			&cli.StringFlag{
+			&cli.StringSliceFlag{
 				Name:    "trace",
 				Aliases: []string{"t"},
-				Value:   "process:new",
-				Usage:   "set trace mode, whether to trace processes or containers, and if to trace new, all, or specific processes/container. run '--trace help' for more info",
+				Value:   nil,
+				Usage:   "select events to trace by defining trace expressions. run '--trace help' for more info.",
 			},
 			&cli.StringSliceFlag{
-				Name:    "filter",
-				Aliases: []string{"f"},
+				Name:    "capture",
+				Aliases: []string{"c"},
 				Value:   nil,
-				Usage:   "set tracing filters for specific fields (such as UID or GID). run '--filter help' for more info.",
+				Usage:   "capture artifacts that were written, executed or found to be suspicious. run '--capture help' for more info.",
 			},
 			&cli.BoolFlag{
 				Name:  "detect-original-syscall",
@@ -174,25 +128,10 @@ func main() {
 				Usage: "size, in pages, of the internal perf ring buffer used to send blobs from the kernel",
 			},
 			&cli.StringFlag{
-				Name:  "output-path",
-				Value: "/tmp/tracee/out",
-				Usage: "path where tracee will save produced artifacts",
-			},
-			&cli.BoolFlag{
-				Name:    "clear-output-path",
-				Aliases: []string{"clear"},
-				Value:   false,
-				Usage:   "clear the output path before starting",
-			},
-			&cli.StringSliceFlag{
-				Name:  "capture",
-				Value: nil,
-				Usage: "capture artifacts that were written, executed or found to be suspicious. captured artifacts will appear in the 'output-path' directory. possible options: 'write'/'exec'/'mem'/'all'. use this flag multiple times to choose multiple capture options",
-			},
-			&cli.StringSliceFlag{
-				Name:  "filter-file-write",
-				Value: nil,
-				Usage: "only output file writes whose path starts with the given path prefix (up to 64 characters)",
+				Name:    "output",
+				Aliases: []string{"o"},
+				Value:   "table",
+				Usage:   "output format: table/table-verbose/json/gob/go-template=<path>",
 			},
 			&cli.BoolFlag{
 				Name:  "security-alerts",
@@ -216,10 +155,16 @@ func main() {
 				Value:       "if-needed",
 				Usage:       "when to build the bpf program. possible options: 'never'/'always'/'if-needed'",
 				Destination: &buildPolicy,
-			}, &cli.StringFlag{
-				Name:  "mntns_pin",
+			},
+			&cli.BoolFlag{
+				Name:  "stack-addresses",
+				Value: false,
+				Usage: "Include stack memory addresses for each event",
+			},
+			&cli.StringFlag{
+				Name:  "pin",
 				Value: "",
-				Usage: "A path to bpf map where the mnt_ns_namespace ids are stored as keys and values are ignored",
+				Usage: "Provide pinning instruction in a format object_type:object_name:pin_path",
 			},
 		},
 	}
@@ -230,35 +175,154 @@ func main() {
 	}
 }
 
-func prepareFilter(filters []string) (tracee.Filter, error) {
+func prepareCapture(captureSlice []string) (tracee.CaptureConfig, error) {
+	captureHelp := `
+Capture artifacts that were written, executed or found to be suspicious.
+Captured artifacts will appear in the 'output-path' directory.
+Possible options:
 
-	filterHelp := "\n--filter allows you to specify values to match on for fields of traced events.\n"
-	filterHelp += "The following options are currently supported:\n"
-	filterHelp += "uid: only trace processes or containers with specified uid(s).\n"
-	filterHelp += "\t--filter uid=0                                                | only trace events from uid 0\n"
-	filterHelp += "\t--filter uid=0,1000                                           | only trace events from uid 0 or uid 1000\n"
-	filterHelp += "\t--filter uid=0 --filter uid=1000                              | only trace events from uid 0 or uid 1000 (same as above)\n"
-	filterHelp += "\t--filter 'uid>0'                                              | only trace events from uids greater than 0"
-	filterHelp += "\t--filter 'uid>0' --filter 'uid<1000'                          | only trace events from uids between 0 and 1000"
-	filterHelp += "\t--filter 'uid>0' --filter uid!=1000                           | only trace events from uids greater than 0 but not 1000"
-	filterHelp += "\n"
-	filterHelp += "pid: only trace processes with specified pids.\n"
-	filterHelp += "\t--filter pid=123                                              | only trace events from pid 123\n"
-	filterHelp += "\t--filter pid!=123                                             | don't trace events from pid 123\n"
-	filterHelp += "\n"
-	filterHelp += "mntns: only trace processes or containers with specified mount namespace(s) ids.\n"
-	filterHelp += "\t--filter mntns=12345678                                       | only trace events from mntns 12345678\n"
-	filterHelp += "\t--filter mntns!=12345678                                      | don't trace events from mntns 12345678\n"
-	filterHelp += "\n"
-	filterHelp += "pidns: only trace processes or containers with specified pid namespace(s) ids.\n"
-	filterHelp += "\t--filter pidns=12345678                                       | only trace events from pidns 12345678\n"
-	filterHelp += "\t--filter pidns!=12345678                                      | don't trace events from pidns 12345678\n"
-	filterHelp += "uts: only trace processes or containers with specified uts namespace(s) name.\n"
-	filterHelp += "\t--filter uts=8215606f23f4                                     | only trace events from uts 8215606f23f4\n"
-	filterHelp += "\t--filter uts!=ab356bc4dd554                                   | don't trace events from uts ab356bc4dd554\n"
-	filterHelp += "comm: only trace processes with specified command name.\n"
-	filterHelp += "\t--filter comm=ls                                              | only trace events from ls command\n"
-	filterHelp += "\t--filter comm!=ls                                             | don't trace events from ls command\n"
+[artifact:]write[=/path/prefix*]   capture written files. A filter can be given to only capture file writes whose path starts with some prefix (up to 50 characters).
+[artifact:]exec                    capture executed files.
+[artifact:]mem                     capture memory regions that had write+execute (w+x) protection, and then changed to execute (x) only.
+[artifact:]all                     capture all of the above artifacts.
+
+dir:/path/to/dir        path where tracee will save produced artifacts (default: /tmp/tracee/out).
+clear-dir               clear the captured artifacts output dir before starting (default: false).
+
+Use this flag multiple times to choose multiple capture options
+`
+
+	if len(captureSlice) == 1 && captureSlice[0] == "help" {
+		return tracee.CaptureConfig{}, fmt.Errorf(captureHelp)
+	}
+
+	capture := tracee.CaptureConfig{}
+
+	outDir := "/tmp/tracee/out"
+	clearDir := false
+
+	var filterFileWrite []string
+	for i := range captureSlice {
+		cap := captureSlice[i]
+		if strings.HasPrefix(cap, "artifact:write") ||
+			strings.HasPrefix(cap, "artifact:exec") ||
+			strings.HasPrefix(cap, "artifact:mem") ||
+			strings.HasPrefix(cap, "artifact:all") {
+			cap = strings.TrimPrefix(cap, "artifact:")
+		}
+		if cap == "write" {
+			capture.FileWrite = true
+		} else if strings.HasPrefix(cap, "write=") && strings.HasSuffix(cap, "*") {
+			capture.FileWrite = true
+			pathPrefix := strings.TrimSuffix(strings.TrimPrefix(cap, "write="), "*")
+			if len(pathPrefix) == 0 {
+				return tracee.CaptureConfig{}, fmt.Errorf("capture write filter cannot be empty")
+			}
+			filterFileWrite = append(filterFileWrite, pathPrefix)
+		} else if cap == "exec" {
+			capture.Exec = true
+		} else if cap == "mem" {
+			capture.Mem = true
+		} else if cap == "all" {
+			capture.FileWrite = true
+			capture.Exec = true
+			capture.Mem = true
+		} else if cap == "clear-dir" {
+			clearDir = true
+		} else if strings.HasPrefix(cap, "dir:") {
+			outDir = strings.TrimPrefix(cap, "dir:")
+			if len(outDir) == 0 {
+				return tracee.CaptureConfig{}, fmt.Errorf("capture output dir cannot be empty")
+			}
+		} else {
+			return tracee.CaptureConfig{}, fmt.Errorf("invalid capture option specified, use '--capture help' for more info")
+		}
+	}
+	capture.FilterFileWrite = filterFileWrite
+	capture.OutputPath = outDir
+
+	if clearDir {
+		os.RemoveAll(outDir)
+	}
+
+	return capture, nil
+}
+
+func preparePinning(pinning string) (string, string, string, error) {
+	if pinning == "" {
+		fmt.Println("Going away")
+		return "", "", "", nil
+	}
+	pinInfo := strings.Split(pinning, ":")
+	if len(pinInfo) != 3 {
+		return "", "", "", fmt.Errorf("In order to pin the object you should provide pin_object_type:pin_object_name:ping_object_path")
+	}
+	typeName := pinInfo[0]
+	objectName := pinInfo[1]
+	path := pinInfo[2]
+	if typeName != "map" {
+		return "", "", "", fmt.Errorf("Only map is allowed as pinning object")
+	}
+
+	return typeName, objectName, path, nil
+}
+
+func prepareFilter(filters []string) (tracee.Filter, error) {
+	filterHelp := `
+Select which events to trace by defining trace expressions that operate on events or process metadata.
+Only events that match all trace expressions will be traced (trace flags are ANDed).
+The following types of expressions are supported:
+
+Numerical expressions which compare numbers and allow the following operators: '=', '!=', '<', '>'.
+Available numerical expressions: uid, pid, mntns, pidns.
+
+String expressions which compares text and allow the following operators: '=', '!='.
+Available string expressions: event, set, uts, comm.
+
+Boolean expressions that check if a boolean is true and allow the following operator: '!'.
+Available boolean expressions: container.
+
+Event arguments can be accessed using 'event_name.event_arg' and provide a way to filter an event by its arguments.
+Event arguments allow the following operators: '=', '!='.
+Strings can be compared as a prefix if ending with '*'.
+
+Non-boolean expressions can compare a field to multiple values separated by ','.
+Multiple values are ORed if used with equals operator '=', but are ANDed if used with any other operator.
+
+The field 'container' and 'pid' also support the special value 'new' which selects new containers or pids, respectively.
+
+The field 'set' selects a set of events to trace according to predefined sets, which can be listed by using the 'list' flag.
+
+The special 'follow' expression declares that not only processes that match the criteria will be traced, but also their descendants.
+
+Examples:
+	--trace pid=new                                              | only trace events from new processes
+	--trace pid=510,1709                                         | only trace events from pid 510 or pid 1709
+	--trace p=510 --trace p=1709                                 | only trace events from pid 510 or pid 1709 (same as above)
+	--trace container=new                                        | only trace events from newly created containers
+	--trace container                                            | only trace events from containers
+	--trace c                                                    | only trace events from containers (same as above)
+	--trace '!container'                                         | only trace events from the host
+	--trace uid=0                                                | only trace events from uid 0
+	--trace mntns=4026531840                                     | only trace events from mntns id 4026531840
+	--trace pidns!=4026531836                                    | only trace events from pidns id not equal to 4026531840
+	--trace 'uid>0'                                              | only trace events from uids greater than 0
+	--trace 'pid>0' --trace 'pid<1000'                           | only trace events from pids between 0 and 1000
+	--trace 'u>0' --trace u!=1000                                | only trace events from uids greater than 0 but not 1000
+	--trace event=execve,open                                    | only trace execve and open events
+	--trace set=fs                                               | trace all file-system related events
+	--trace s=fs --trace e!=open,openat                          | trace all file-system related events, but not open(at)
+	--trace uts!=ab356bc4dd554                                   | don't trace events from uts name ab356bc4dd554
+	--trace comm=ls                                              | only trace events from ls command
+	--trace close.fd=5                                           | only trace 'close' events that have 'fd' equals 5
+	--trace openat.pathname=/tmp*                                | only trace 'openat' events that have 'pathname' prefixed by "/tmp"
+	--trace openat.pathname!=/tmp/1,/bin/ls                      | don't trace 'openat' events that have 'pathname' equals /tmp/1 or /bin/ls
+	--trace comm=bash --trace follow                             | trace all events that originated from bash or from one of the processes spawned by bash
+
+
+Note: some of the above operators have special meanings in different shells.
+To 'escape' those operators, please use single quotes, e.g.: 'uid>0'
+`
 
 	if len(filters) == 1 && filters[0] == "help" {
 		return tracee.Filter{}, fmt.Errorf(filterHelp)
@@ -271,7 +335,6 @@ func prepareFilter(filters []string) (tracee.Filter, error) {
 			Less:     tracee.LessNotSet,
 			Greater:  tracee.GreaterNotSet,
 			Is32Bit:  true,
-			Enabled:  false,
 		},
 		PIDFilter: &tracee.UintFilter{
 			Equal:    []uint64{},
@@ -279,86 +342,179 @@ func prepareFilter(filters []string) (tracee.Filter, error) {
 			Less:     tracee.LessNotSet,
 			Greater:  tracee.GreaterNotSet,
 			Is32Bit:  true,
-			Enabled:  false,
 		},
+		NewPidFilter: &tracee.BoolFilter{},
 		MntNSFilter: &tracee.UintFilter{
 			Equal:    []uint64{},
 			NotEqual: []uint64{},
 			Less:     tracee.LessNotSet,
 			Greater:  tracee.GreaterNotSet,
-			Is32Bit:  false,
-			Enabled:  false,
 		},
 		PidNSFilter: &tracee.UintFilter{
 			Equal:    []uint64{},
 			NotEqual: []uint64{},
 			Less:     tracee.LessNotSet,
 			Greater:  tracee.GreaterNotSet,
-			Is32Bit:  false,
-			Enabled:  false,
 		},
 		UTSFilter: &tracee.StringFilter{
 			Equal:    []string{},
 			NotEqual: []string{},
-			Enabled:  false,
 		},
 		CommFilter: &tracee.StringFilter{
 			Equal:    []string{},
 			NotEqual: []string{},
-			Enabled:  false,
 		},
+		ContFilter:    &tracee.BoolFilter{},
+		NewContFilter: &tracee.BoolFilter{},
+		ArgFilter: &tracee.ArgFilter{
+			Filters: make(map[int32]map[string]tracee.ArgFilterVal),
+		},
+		EventsToTrace: []int32{},
+	}
+
+	eventFilter := &tracee.StringFilter{Equal: []string{}, NotEqual: []string{}}
+	setFilter := &tracee.StringFilter{Equal: []string{}, NotEqual: []string{}}
+
+	eventsNameToID := make(map[string]int32, len(tracee.EventsIDToEvent))
+	for _, event := range tracee.EventsIDToEvent {
+		eventsNameToID[event.Name] = event.ID
 	}
 
 	for _, f := range filters {
-		if strings.HasPrefix(f, "uid") {
-			err := parseUintFilter(strings.TrimPrefix(f, "uid"), filter.UIDFilter)
+		filterName := f
+		operatorAndValues := ""
+		operatorIndex := strings.IndexAny(f, "=!<>")
+		if operatorIndex > 0 {
+			filterName = f[0:operatorIndex]
+			operatorAndValues = f[operatorIndex:]
+		}
+
+		if strings.Contains(f, ".") {
+			err := parseArgFilter(filterName, operatorAndValues, eventsNameToID, filter.ArgFilter)
 			if err != nil {
 				return tracee.Filter{}, err
 			}
 			continue
 		}
 
-		if strings.HasPrefix(f, "mntns") {
-			err := parseUintFilter(strings.TrimPrefix(f, "mntns"), filter.MntNSFilter)
+		// The filters which are more common (container, event, pid, set, uid) can be given using a prefix of them.
+		// Other filters should be given using their full name.
+		// To avoid collisions between filters that share the same prefix, put the filters which should have an exact match first!
+		if filterName == "comm" {
+			err := parseStringFilter(operatorAndValues, filter.CommFilter)
 			if err != nil {
 				return tracee.Filter{}, err
 			}
 			continue
 		}
 
-		if strings.HasPrefix(f, "pidns") {
-			err := parseUintFilter(strings.TrimPrefix(f, "pidns"), filter.PidNSFilter)
+		if strings.HasPrefix("container", f) || (strings.HasPrefix("!container", f) && len(f) > 1) {
+			filter.NewPidFilter.Enabled = true
+			filter.NewPidFilter.Value = true
+			err := parseBoolFilter(f, filter.ContFilter)
 			if err != nil {
 				return tracee.Filter{}, err
 			}
 			continue
 		}
 
-		if strings.HasPrefix(f, "pid") {
-			err := parseUintFilter(strings.TrimPrefix(f, "pid"), filter.PIDFilter)
+		if strings.HasPrefix("container", filterName) {
+			if operatorAndValues == "=new" {
+				filter.NewPidFilter.Enabled = true
+				filter.NewPidFilter.Value = true
+				filter.NewContFilter.Enabled = true
+				filter.NewContFilter.Value = true
+				continue
+			}
+			if operatorAndValues == "!=new" {
+				filter.ContFilter.Enabled = true
+				filter.ContFilter.Value = true
+				filter.NewPidFilter.Enabled = true
+				filter.NewPidFilter.Value = true
+				filter.NewContFilter.Enabled = true
+				filter.NewContFilter.Value = false
+				continue
+			}
+		}
+
+		if strings.HasPrefix("event", filterName) {
+			err := parseStringFilter(operatorAndValues, eventFilter)
 			if err != nil {
 				return tracee.Filter{}, err
 			}
 			continue
 		}
 
-		if strings.HasPrefix(f, "uts") {
-			err := parseStringFilter(strings.TrimPrefix(f, "uts"), filter.UTSFilter)
+		if filterName == "mntns" {
+			err := parseUintFilter(operatorAndValues, filter.MntNSFilter)
 			if err != nil {
 				return tracee.Filter{}, err
 			}
 			continue
 		}
 
-		if strings.HasPrefix(f, "comm") {
-			err := parseStringFilter(strings.TrimPrefix(f, "comm"), filter.CommFilter)
+		if filterName == "pidns" {
+			err := parseUintFilter(operatorAndValues, filter.PidNSFilter)
 			if err != nil {
 				return tracee.Filter{}, err
 			}
+			continue
+		}
+
+		if strings.HasPrefix("pid", filterName) {
+			if operatorAndValues == "=new" {
+				filter.NewPidFilter.Enabled = true
+				filter.NewPidFilter.Value = true
+				continue
+			}
+			if operatorAndValues == "!=new" {
+				filter.NewPidFilter.Enabled = true
+				filter.NewPidFilter.Value = false
+				continue
+			}
+			err := parseUintFilter(operatorAndValues, filter.PIDFilter)
+			if err != nil {
+				return tracee.Filter{}, err
+			}
+			continue
+		}
+
+		if strings.HasPrefix("set", filterName) {
+			err := parseStringFilter(operatorAndValues, setFilter)
+			if err != nil {
+				return tracee.Filter{}, err
+			}
+			continue
+		}
+
+		if filterName == "uts" {
+			err := parseStringFilter(operatorAndValues, filter.UTSFilter)
+			if err != nil {
+				return tracee.Filter{}, err
+			}
+			continue
+		}
+
+		if strings.HasPrefix("uid", filterName) {
+			err := parseUintFilter(operatorAndValues, filter.UIDFilter)
+			if err != nil {
+				return tracee.Filter{}, err
+			}
+			continue
+		}
+
+		if strings.HasPrefix("follow", f) {
+			filter.Follow = true
 			continue
 		}
 
 		return tracee.Filter{}, fmt.Errorf("invalid filter option specified, use '--filter help' for more info")
+	}
+
+	var err error
+	filter.EventsToTrace, err = prepareEventsToTrace(eventFilter, setFilter, eventsNameToID)
+	if err != nil {
+		return tracee.Filter{}, err
 	}
 
 	return filter, nil
@@ -366,14 +522,14 @@ func prepareFilter(filters []string) (tracee.Filter, error) {
 
 func parseUintFilter(operatorAndValues string, uintFilter *tracee.UintFilter) error {
 	uintFilter.Enabled = true
-	if len(operatorAndValues) < 1 {
+	if len(operatorAndValues) < 2 {
 		return fmt.Errorf("invalid operator and/or values given to filter: %s", operatorAndValues)
 	}
 	valuesString := string(operatorAndValues[1:])
 	operatorString := string(operatorAndValues[0])
 
 	if operatorString == "!" {
-		if len(operatorAndValues) < 2 {
+		if len(operatorAndValues) < 3 {
 			return fmt.Errorf("invalid operator and/or values given to filter: %s", operatorAndValues)
 		}
 		operatorString = operatorAndValues[0:2]
@@ -413,14 +569,14 @@ func parseUintFilter(operatorAndValues string, uintFilter *tracee.UintFilter) er
 
 func parseStringFilter(operatorAndValues string, stringFilter *tracee.StringFilter) error {
 	stringFilter.Enabled = true
-	if len(operatorAndValues) < 1 {
+	if len(operatorAndValues) < 2 {
 		return fmt.Errorf("invalid operator and/or values given to filter: %s", operatorAndValues)
 	}
 	valuesString := string(operatorAndValues[1:])
 	operatorString := string(operatorAndValues[0])
 
 	if operatorString == "!" {
-		if len(operatorAndValues) < 2 {
+		if len(operatorAndValues) < 3 {
 			return fmt.Errorf("invalid operator and/or values given to filter: %s", operatorAndValues)
 		}
 		operatorString = operatorAndValues[0:2]
@@ -430,9 +586,6 @@ func parseStringFilter(operatorAndValues string, stringFilter *tracee.StringFilt
 	values := strings.Split(valuesString, ",")
 
 	for i := range values {
-		if len(values[i]) > 16 {
-			return fmt.Errorf("Filtering strings of length bigger than 16 is not supported: %s", values[i])
-		}
 		switch operatorString {
 		case "=":
 			stringFilter.Equal = append(stringFilter.Equal, values[i])
@@ -446,83 +599,89 @@ func parseStringFilter(operatorAndValues string, stringFilter *tracee.StringFilt
 	return nil
 }
 
-func prepareTraceMode(traceString string) (uint32, error) {
-	// Set Default mode - all new Processes only
-	if traceString == "pinned_map" {
-		return tracee.ModeMapPinned, nil
-	}
-	mode := tracee.ModeProcessNew
-	traceHelp := "\n--trace can be the following options:\n"
-	traceHelp += "'p' or 'process' or 'process:new'            | Trace new processes\n"
-	traceHelp += "'process:all'                                | Trace all processes\n"
-	traceHelp += "'process:<pid>,<pid2>,...' or 'p:<pid>,...'  | Trace specific PIDs\n"
-	traceHelp += "'process:follow'                             | Trace filtered process and all of its children\n"
-	traceHelp += "'c' or 'container' or 'container:new'        | Trace new containers\n"
-	traceHelp += "'container:all'                              | Trace all containers\n"
-	traceHelp += "''h' or 'host' or 'host:new'                 | Trace new processes not in a container\n"
-	traceHelp += "'host:all'                                   | Trace all processes not in a container\n"
-	traceHelp += "'pinned_map'                                 | Trace processes in specific namespaces provided in map, requires valid map pinning passed via --mntns_pin parameter\n"
-	if traceString == "help" {
-		return 0, fmt.Errorf(traceHelp)
+func parseBoolFilter(value string, boolFilter *tracee.BoolFilter) error {
+	boolFilter.Enabled = true
+	boolFilter.Value = false
+	if value[0] != '!' {
+		boolFilter.Value = true
 	}
 
-	traceSplit := strings.Split(traceString, ":")
-
-	// Get The trace type - process or  container
-	traceType := traceSplit[0]
-	if traceType != "process" && traceType != "container" && traceType != "host" && traceType != "p" && traceType != "c" && traceType != "h" {
-		return 0, fmt.Errorf(traceHelp)
-	}
-	traceType = string(traceType[0])
-
-	// Get The trace option, default is 'new' for all trace types:
-	traceOption := "new"
-	if len(traceSplit) == 2 {
-		traceOption = traceSplit[1]
-	} else if len(traceSplit) > 2 {
-		return 0, fmt.Errorf(traceHelp)
-	}
-
-	// Convert to Traceing Mode
-	if traceType == "p" {
-		if traceOption == "all" {
-			mode = tracee.ModeProcessAll
-		} else if traceOption == "new" {
-			mode = tracee.ModeProcessNew
-		} else if traceOption == "follow" {
-			mode = tracee.ModeProcessFollow
-		} else {
-			// Can't have just 'process:'
-			return 0, fmt.Errorf(traceHelp)
-		}
-	} else if traceType == "c" {
-		if traceOption == "all" {
-			mode = tracee.ModeContainerAll
-		} else if traceOption == "new" {
-			mode = tracee.ModeContainerNew
-		} else {
-			// Containers currently only supports 'new' and 'all'
-			return 0, fmt.Errorf(traceHelp)
-		}
-	} else {
-		if traceOption == "all" {
-			mode = tracee.ModeHostAll
-		} else if traceOption == "new" {
-			mode = tracee.ModeHostNew
-		} else {
-			return 0, fmt.Errorf(traceHelp)
-		}
-	}
-	return mode, nil
+	return nil
 }
 
-func prepareEventsToTrace(eventsToTrace []string, setsToTrace []string, excludeEvents []string) ([]int32, error) {
+func parseArgFilter(filterName string, operatorAndValues string, eventsNameToID map[string]int32, argFilter *tracee.ArgFilter) error {
+	argFilter.Enabled = true
+	// Event argument filter has the following format: "event.argname=argval"
+	// filterName have the format event:argname, and operatorAndValues have the format "=argval"
+	splitFilter := strings.Split(filterName, ".")
+	if len(splitFilter) != 2 {
+		return fmt.Errorf("invalid argument filter format %s%s", filterName, operatorAndValues)
+	}
+	eventName := splitFilter[0]
+	argName := splitFilter[1]
+
+	id, ok := eventsNameToID[eventName]
+	if !ok {
+		return fmt.Errorf("invalid argument filter event name: %s", eventName)
+	}
+
+	eventParams, ok := tracee.EventsIDToParams[id]
+	if !ok {
+		return fmt.Errorf("invalid argument filter event name: %s", eventName)
+	}
+
+	// check if argument name exists for this event
+	argFound := false
+	for i := range eventParams {
+		if eventParams[i].Name == argName {
+			argFound = true
+			break
+		}
+	}
+
+	if !argFound {
+		return fmt.Errorf("invalid argument filter argument name: %s", argName)
+	}
+
+	strFilter := &tracee.StringFilter{
+		Equal:    []string{},
+		NotEqual: []string{},
+	}
+
+	// Treat operatorAndValues as a string filter to avoid code duplication
+	err := parseStringFilter(operatorAndValues, strFilter)
+	if err != nil {
+		return err
+	}
+
+	if _, ok := argFilter.Filters[id]; !ok {
+		argFilter.Filters[id] = make(map[string]tracee.ArgFilterVal)
+	}
+
+	if _, ok := argFilter.Filters[id][argName]; !ok {
+		argFilter.Filters[id][argName] = tracee.ArgFilterVal{}
+	}
+
+	val := argFilter.Filters[id][argName]
+
+	val.Equal = append(val.Equal, strFilter.Equal...)
+	val.NotEqual = append(val.NotEqual, strFilter.NotEqual...)
+
+	argFilter.Filters[id][argName] = val
+
+	return nil
+}
+
+func prepareEventsToTrace(eventFilter *tracee.StringFilter, setFilter *tracee.StringFilter, eventsNameToID map[string]int32) ([]int32, error) {
+	eventFilter.Enabled = true
+	eventsToTrace := eventFilter.Equal
+	excludeEvents := eventFilter.NotEqual
+	setsToTrace := setFilter.Equal
+
 	var res []int32
-	eventsNameToID := make(map[string]int32, len(tracee.EventsIDToEvent))
 	setsToEvents := make(map[string][]int32)
 	isExcluded := make(map[int32]bool)
 	for id, event := range tracee.EventsIDToEvent {
-		eventsNameToID[event.Name] = event.ID
 		for _, set := range event.Sets {
 			setsToEvents[set] = append(setsToEvents[set], id)
 		}
@@ -534,7 +693,7 @@ func prepareEventsToTrace(eventsToTrace []string, setsToTrace []string, excludeE
 		}
 		isExcluded[id] = true
 	}
-	if eventsToTrace == nil && setsToTrace == nil {
+	if len(eventsToTrace) == 0 && len(setsToTrace) == 0 {
 		setsToTrace = append(setsToTrace, "default")
 	}
 
@@ -580,28 +739,58 @@ func getSelfCapabilities() (capability.Capabilities, error) {
 	return cap, nil
 }
 
+func fetchFormattedEventParams(eventID int32) string {
+	eventParams := tracee.EventsIDToParams[eventID]
+	var verboseEventParams string
+	verboseEventParams += "("
+	prefix := ""
+	for index, arg := range eventParams {
+		if index == 0 {
+			verboseEventParams += arg.Type + " " + arg.Name
+			prefix = ", "
+			continue
+		}
+		verboseEventParams += prefix + arg.Type + " " + arg.Name
+	}
+	verboseEventParams += ")"
+	return verboseEventParams
+}
+
+func getPad(padChar string, padLength int) (pad string) {
+	for i := 0; i < padLength; i++ {
+		pad += padChar
+	}
+	return
+}
+
 func printList() {
+	padChar, firstPadLen, secondPadLen := " ", 9, 36
+	titleHeaderPadFirst := getPad(padChar, firstPadLen)
+	titleHeaderPadSecond := getPad(padChar, secondPadLen)
+
 	var b strings.Builder
-	b.WriteString("System Calls:              Sets:\n")
-	b.WriteString("____________               ____\n\n")
+	b.WriteString("System Calls: " + titleHeaderPadFirst + "Sets:" + titleHeaderPadSecond + "Arguments:\n")
+	b.WriteString("____________  " + titleHeaderPadFirst + "____ " + titleHeaderPadSecond + "_________" + "\n\n")
 	for i := 0; i < int(tracee.SysEnterEventID); i++ {
-		event, ok := tracee.EventsIDToEvent[int32(i)]
+		index := int32(i)
+		event, ok := tracee.EventsIDToEvent[index]
 		if !ok {
 			continue
 		}
 		if event.Sets != nil {
-			eventSets := fmt.Sprintf("%-23s    %v\n", event.Name, event.Sets)
+			eventSets := fmt.Sprintf("%-22s %-40s %s\n", event.Name, fmt.Sprintf("%v", event.Sets), fetchFormattedEventParams(index))
 			b.WriteString(eventSets)
 		} else {
 			b.WriteString(event.Name + "\n")
 		}
 	}
-	b.WriteString("\n\nOther Events:              Sets:\n")
-	b.WriteString("____________               ____\n\n")
+	b.WriteString("\n\nOther Events: " + titleHeaderPadFirst + "Sets:" + titleHeaderPadSecond + "Arguments:\n")
+	b.WriteString("____________  " + titleHeaderPadFirst + "____ " + titleHeaderPadSecond + "_________\n\n")
 	for i := int(tracee.SysEnterEventID); i < int(tracee.MaxEventID); i++ {
-		event := tracee.EventsIDToEvent[int32(i)]
+		index := int32(i)
+		event := tracee.EventsIDToEvent[index]
 		if event.Sets != nil {
-			eventSets := fmt.Sprintf("%-23s    %v\n", event.Name, event.Sets)
+			eventSets := fmt.Sprintf("%-22s %-40s %s\n", event.Name, fmt.Sprintf("%v", event.Sets), fetchFormattedEventParams(index))
 			b.WriteString(eventSets)
 		} else {
 			b.WriteString(event.Name + "\n")

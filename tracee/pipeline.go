@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"sync"
+
+	"github.com/aquasecurity/tracee/tracee/external"
 )
 
 func (t *Tracee) runEventPipeline(done <-chan struct{}) error {
@@ -106,8 +109,38 @@ func (t *Tracee) processRawEvent(done <-chan struct{}, in <-chan RawEvent) (<-ch
 	return out, errc, nil
 }
 
-func (t *Tracee) prepareEventForPrint(done <-chan struct{}, in <-chan RawEvent) (<-chan Event, <-chan error, error) {
-	out := make(chan Event, 1000)
+func (t *Tracee) getStackAddresses(StackID uint32) ([]uint64, error) {
+	StackAddresses := make([]uint64, maxStackDepth)
+	stackFrameSize := (strconv.IntSize / 8)
+
+	// Lookup the StackID in the map
+	// The ID could have aged out of the Map, as it only holds a finite number of
+	// Stack IDs in it's Map
+	stackBytes, err := t.StackAddressesMap.GetValue(StackID, stackFrameSize*maxStackDepth)
+	if err != nil {
+		return StackAddresses[0:0], nil
+	}
+
+	stackCounter := 0
+	for i := 0; i < len(stackBytes); i += stackFrameSize {
+		StackAddresses[stackCounter] = 0
+		stackAddr := binary.LittleEndian.Uint64(stackBytes[i : i+stackFrameSize])
+		if stackAddr == 0 {
+			break
+		}
+		StackAddresses[stackCounter] = stackAddr
+		stackCounter++
+	}
+
+	// Attempt to remove the ID from the map so we don't fill it up
+	// But if this fails continue on
+	_ = t.StackAddressesMap.DeleteKey(StackID)
+
+	return StackAddresses[0:stackCounter], nil
+}
+
+func (t *Tracee) prepareEventForPrint(done <-chan struct{}, in <-chan RawEvent) (<-chan external.Event, <-chan error, error) {
+	out := make(chan external.Event, 1000)
 	errc := make(chan error, 1)
 	go func() {
 		defer close(out)
@@ -122,18 +155,25 @@ func (t *Tracee) prepareEventForPrint(done <-chan struct{}, in <-chan RawEvent) 
 				continue
 			}
 			args := make([]interface{}, rawEvent.Ctx.Argnum)
-			argsNames := make([]string, rawEvent.Ctx.Argnum)
+			argMetas := make([]external.ArgMeta, rawEvent.Ctx.Argnum)
 			for i, tag := range rawEvent.ArgsTags {
 				args[i] = rawEvent.RawArgs[tag]
-				argName, ok := t.DecParamName[rawEvent.Ctx.EventID%2][tag]
+				argMeta, ok := t.DecParamName[rawEvent.Ctx.EventID%2][tag]
 				if ok {
-					argsNames[i] = argName
+					argMetas[i] = argMeta
 				} else {
 					errc <- fmt.Errorf("Invalid arg tag for event %d", rawEvent.Ctx.EventID)
 					continue
 				}
 			}
-			evt, err := newEvent(rawEvent.Ctx, argsNames, args)
+
+			// Add stack trace if needed
+			var StackAddresses []uint64
+			if t.config.StackAddresses {
+				StackAddresses, _ = t.getStackAddresses(rawEvent.Ctx.StackID)
+			}
+
+			evt, err := newEvent(rawEvent.Ctx, argMetas, args, StackAddresses)
 			if err != nil {
 				errc <- err
 				continue
@@ -148,7 +188,7 @@ func (t *Tracee) prepareEventForPrint(done <-chan struct{}, in <-chan RawEvent) 
 	return out, errc, nil
 }
 
-func (t *Tracee) printEvent(done <-chan struct{}, in <-chan Event) (<-chan error, error) {
+func (t *Tracee) printEvent(done <-chan struct{}, in <-chan external.Event) (<-chan error, error) {
 	errc := make(chan error, 1)
 	go func() {
 		defer close(errc)

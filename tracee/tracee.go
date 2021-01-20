@@ -15,39 +15,44 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	bpf "github.com/aquasecurity/tracee/libbpfgo"
+	"github.com/aquasecurity/tracee/tracee/external"
+	bpf "github.com/ogozman/tracee-1/libbpfgo"
 )
 
 // TraceeConfig is a struct containing user defined configuration of tracee
 type TraceeConfig struct {
-	EventsToTrace         []int32
-	Mode                  uint32
 	Filter                *Filter
+	Capture               *CaptureConfig
 	DetectOriginalSyscall bool
 	ShowExecEnv           bool
 	OutputFormat          string
 	PerfBufferSize        int
 	BlobPerfBufferSize    int
-	OutputPath            string
-	CaptureWrite          bool
-	CaptureExec           bool
-	CaptureMem            bool
-	FilterFileWrite       []string
 	SecurityAlerts        bool
 	EventsFile            *os.File
 	ErrorsFile            *os.File
 	maxPidsCache          int // maximum number of pids to cache per mnt ns (in Tracee.pidsInMntns)
 	BPFObjPath            string
-	NSMapPinning          string
+	StackAddresses        bool
+	PinObjectType         string
+	PinObjectName         string
+	PinPath               string
+	Pin                   bool
 }
 
 type Filter struct {
-	UIDFilter   *UintFilter
-	PIDFilter   *UintFilter
-	MntNSFilter *UintFilter
-	PidNSFilter *UintFilter
-	UTSFilter   *StringFilter
-	CommFilter  *StringFilter
+	EventsToTrace []int32
+	UIDFilter     *UintFilter
+	PIDFilter     *UintFilter
+	NewPidFilter  *BoolFilter
+	MntNSFilter   *UintFilter
+	PidNSFilter   *UintFilter
+	UTSFilter     *StringFilter
+	CommFilter    *StringFilter
+	ContFilter    *BoolFilter
+	NewContFilter *BoolFilter
+	ArgFilter     *ArgFilter
+	Follow        bool
 }
 
 type UintFilter struct {
@@ -65,17 +70,60 @@ type StringFilter struct {
 	Enabled  bool
 }
 
+type BoolFilter struct {
+	Value   bool
+	Enabled bool
+}
+
+type ArgFilter struct {
+	Filters map[int32]map[string]ArgFilterVal // key to the first map is event id, and to the second map the argument name
+	Enabled bool
+}
+
+type ArgFilterVal struct {
+	argTag   argTag
+	Equal    []string
+	NotEqual []string
+}
+
+type CaptureConfig struct {
+	OutputPath      string
+	FileWrite       bool
+	FilterFileWrite []string
+	Exec            bool
+	Mem             bool
+}
+
 // Validate does static validation of the configuration
 func (tc TraceeConfig) Validate() error {
-	if tc.EventsToTrace == nil {
+	if tc.Filter.EventsToTrace == nil {
 		return fmt.Errorf("eventsToTrace is nil")
 	}
 	if tc.OutputFormat != "table" && tc.OutputFormat != "table-verbose" && tc.OutputFormat != "json" && tc.OutputFormat != "gob" && !strings.HasPrefix(tc.OutputFormat, "go-template=") {
 		return fmt.Errorf("unrecognized output format: %s", tc.OutputFormat)
 	}
-	for _, e := range tc.EventsToTrace {
+	for _, e := range tc.Filter.EventsToTrace {
 		if _, ok := EventsIDToEvent[e]; !ok {
 			return fmt.Errorf("invalid event to trace: %d", e)
+		}
+	}
+	for eventID, eventFilters := range tc.Filter.ArgFilter.Filters {
+		for argName, _ := range eventFilters {
+			eventParams, ok := EventsIDToParams[eventID]
+			if !ok {
+				return fmt.Errorf("invalid argument filter event id: %d", eventID)
+			}
+			// check if argument name exists for this event
+			argFound := false
+			for i := range eventParams {
+				if eventParams[i].Name == argName {
+					argFound = true
+					break
+				}
+			}
+			if !argFound {
+				return fmt.Errorf("invalid argument filter argument name: %s", argName)
+			}
 		}
 	}
 	if (tc.PerfBufferSize & (tc.PerfBufferSize - 1)) != 0 {
@@ -84,12 +132,12 @@ func (tc TraceeConfig) Validate() error {
 	if (tc.BlobPerfBufferSize & (tc.BlobPerfBufferSize - 1)) != 0 {
 		return fmt.Errorf("invalid perf buffer size - must be a power of 2")
 	}
-	if len(tc.FilterFileWrite) > 3 {
+	if len(tc.Capture.FilterFileWrite) > 3 {
 		return fmt.Errorf("too many file-write filters given")
 	}
-	for _, filter := range tc.FilterFileWrite {
-		if len(filter) > 64 {
-			return fmt.Errorf("The length of a path filter is limited to 64 characters: %s", filter)
+	for _, filter := range tc.Capture.FilterFileWrite {
+		if len(filter) > 50 {
+			return fmt.Errorf("The length of a path filter is limited to 50 characters: %s", filter)
 		}
 	}
 	_, err := os.Stat(tc.BPFObjPath)
@@ -101,22 +149,24 @@ func (tc TraceeConfig) Validate() error {
 
 // Tracee traces system calls and system events using eBPF
 type Tracee struct {
-	config        TraceeConfig
-	eventsToTrace map[int32]bool
-	bpfModule     *bpf.Module
-	eventsPerfMap *bpf.PerfBuffer
-	fileWrPerfMap *bpf.PerfBuffer
-	eventsChannel chan []byte
-	fileWrChannel chan []byte
-	lostEvChannel chan uint64
-	lostWrChannel chan uint64
-	printer       eventPrinter
-	stats         statsStore
-	capturedFiles map[string]int64
-	mntNsFirstPid map[uint32]uint32
-	DecParamName  [2]map[argTag]string
-	EncParamName  [2]map[string]argTag
-	pidsInMntns   bucketsCache //record the first n PIDs (host) in each mount namespace, for internal usage
+	config            TraceeConfig
+	eventsToTrace     map[int32]bool
+	bpfModule         *bpf.Module
+	eventsPerfMap     *bpf.PerfBuffer
+	fileWrPerfMap     *bpf.PerfBuffer
+	eventsChannel     chan []byte
+	fileWrChannel     chan []byte
+	lostEvChannel     chan uint64
+	lostWrChannel     chan uint64
+	printer           eventPrinter
+	stats             statsStore
+	capturedFiles     map[string]int64
+	writtenFiles      map[string]string
+	mntNsFirstPid     map[uint32]uint32
+	DecParamName      [2]map[argTag]external.ArgMeta
+	EncParamName      [2]map[string]argTag
+	pidsInMntns       bucketsCache //record the first n PIDs (host) in each mount namespace, for internal usage
+	StackAddressesMap *bpf.BPFMap
 }
 
 type counter int32
@@ -153,31 +203,33 @@ func New(cfg TraceeConfig) (*Tracee, error) {
 		event.EssentialEvent = true
 		EventsIDToEvent[id] = event
 	}
-	if cfg.CaptureExec {
+	if cfg.Capture.Exec {
 		setEssential(SecurityBprmCheckEventID)
 	}
-	if cfg.CaptureWrite {
+	if cfg.Capture.FileWrite {
 		setEssential(VfsWriteEventID)
+		setEssential(VfsWritevEventID)
 	}
-	if cfg.SecurityAlerts || cfg.CaptureMem {
+	if cfg.SecurityAlerts || cfg.Capture.Mem {
 		setEssential(MmapEventID)
 		setEssential(MprotectEventID)
 	}
-	if cfg.CaptureMem {
+	if cfg.Capture.Mem {
 		setEssential(MemProtAlertEventID)
 	}
 	// create tracee
 	t := &Tracee{
 		config: cfg,
 	}
-	ContainerMode := (t.config.Mode == ModeContainerAll || t.config.Mode == ModeContainerNew)
+	ContainerMode := (t.config.Filter.ContFilter.Enabled && t.config.Filter.ContFilter.Value) ||
+		(t.config.Filter.NewContFilter.Enabled && t.config.Filter.NewContFilter.Value)
 	printObj, err := newEventPrinter(t.config.OutputFormat, ContainerMode, t.config.EventsFile, t.config.ErrorsFile)
 	if err != nil {
 		return nil, err
 	}
 	t.printer = printObj
-	t.eventsToTrace = make(map[int32]bool, len(t.config.EventsToTrace))
-	for _, e := range t.config.EventsToTrace {
+	t.eventsToTrace = make(map[int32]bool, len(t.config.Filter.EventsToTrace))
+	for _, e := range t.config.Filter.EventsToTrace {
 		// Map value is true iff events requested by the user
 		t.eventsToTrace[e] = true
 	}
@@ -190,9 +242,9 @@ func New(cfg TraceeConfig) (*Tracee, error) {
 		}
 	}
 
-	t.DecParamName[0] = make(map[argTag]string)
+	t.DecParamName[0] = make(map[argTag]external.ArgMeta)
 	t.EncParamName[0] = make(map[string]argTag)
-	t.DecParamName[1] = make(map[argTag]string)
+	t.DecParamName[1] = make(map[argTag]external.ArgMeta)
 	t.EncParamName[1] = make(map[string]argTag)
 
 	err = t.initBPF(cfg.BPFObjPath)
@@ -201,6 +253,7 @@ func New(cfg TraceeConfig) (*Tracee, error) {
 		return nil, err
 	}
 
+	t.writtenFiles = make(map[string]string)
 	t.capturedFiles = make(map[string]int64)
 	//set a default value for config.maxPidsCache
 	if t.config.maxPidsCache == 0 {
@@ -217,13 +270,22 @@ func New(cfg TraceeConfig) (*Tracee, error) {
 		}
 	}
 
-	if err := os.MkdirAll(t.config.OutputPath, 0755); err != nil {
+	if err := os.MkdirAll(t.config.Capture.OutputPath, 0755); err != nil {
 		return nil, fmt.Errorf("error creating output path: %v", err)
 	}
-	err = ioutil.WriteFile(path.Join(t.config.OutputPath, "tracee.pid"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0640)
+	// Todo: tracee.pid should be in a known constant location. /var/run is probably a better choice
+	err = ioutil.WriteFile(path.Join(t.config.Capture.OutputPath, "tracee.pid"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0640)
 	if err != nil {
 		return nil, fmt.Errorf("error creating readiness file: %v", err)
 	}
+
+	// Get refernce to stack trace addresses map
+	StackAddressesMap, err := t.bpfModule.GetMap("stack_addresses")
+	if err != nil {
+		return nil, fmt.Errorf("error getting acces to 'stack_addresses' eBPF Map %v", err)
+	}
+	t.StackAddressesMap = StackAddressesMap
+
 	return t, nil
 }
 
@@ -335,7 +397,7 @@ func (t *Tracee) initEventsParams() map[int32][]eventParam {
 	paramT := noneT
 	for id, params := range EventsIDToParams {
 		for _, param := range params {
-			switch param.pType {
+			switch param.Type {
 			case "int", "pid_t", "uid_t", "gid_t", "mqd_t", "clockid_t", "const clockid_t", "key_t", "key_serial_t", "timer_t":
 				paramT = intT
 			case "unsigned int", "u32":
@@ -369,14 +431,14 @@ func (t *Tracee) initEventsParams() map[int32][]eventParam {
 			// To keep on low communication overhead, we don't change this to u16
 			// Instead, use an array of enc/dec maps, where the key is modulus of the event id
 			// This can easilly be expanded in the future if required
-			if !seenNames[id%2][param.pName] {
-				seenNames[id%2][param.pName] = true
-				t.EncParamName[id%2][param.pName] = ParamNameCounter[id%2]
-				t.DecParamName[id%2][ParamNameCounter[id%2]] = param.pName
+			if !seenNames[id%2][param.Name] {
+				seenNames[id%2][param.Name] = true
+				t.EncParamName[id%2][param.Name] = ParamNameCounter[id%2]
+				t.DecParamName[id%2][ParamNameCounter[id%2]] = param
 				eventsParams[id] = append(eventsParams[id], eventParam{encType: paramT, encName: ParamNameCounter[id%2]})
 				ParamNameCounter[id%2]++
 			} else {
-				eventsParams[id] = append(eventsParams[id], eventParam{encType: paramT, encName: t.EncParamName[id%2][param.pName]})
+				eventsParams[id] = append(eventsParams[id], eventParam{encType: paramT, encName: t.EncParamName[id%2][param.Name]})
 			}
 		}
 	}
@@ -419,6 +481,7 @@ func (t *Tracee) setUintFilter(filter *UintFilter, filterMapName string, configF
 	}
 
 	inequalityFilter, err := t.bpfModule.GetMap("inequality_filter")
+	fmt.Println("This is where we error")
 	if err != nil {
 		return err
 	}
@@ -480,8 +543,25 @@ func (t *Tracee) setStringFilter(filter *StringFilter, filterMapName string, con
 	return nil
 }
 
-func (t *Tracee) populateBPFMaps() error {
+func (t *Tracee) setBoolFilter(filter *BoolFilter, configFilter bpfConfig) error {
+	if !filter.Enabled {
+		return nil
+	}
 
+	bpfConfigMap, err := t.bpfModule.GetMap("config_map")
+	if err != nil {
+		return err
+	}
+	if filter.Value {
+		bpfConfigMap.Update(uint32(configFilter), filterIn)
+	} else {
+		bpfConfigMap.Update(uint32(configFilter), filterOut)
+	}
+
+	return nil
+}
+
+func (t *Tracee) populateBPFMaps() error {
 	chosenEventsMap, _ := t.bpfModule.GetMap("chosen_events_map")
 	for e, chosen := range t.eventsToTrace {
 		// Set chosen events map according to events chosen by the user
@@ -498,17 +578,14 @@ func (t *Tracee) populateBPFMaps() error {
 
 	// Initialize config and pids maps
 	bpfConfigMap, _ := t.bpfModule.GetMap("config_map")
-	//bpfPinnedMap, _ := t.bpfModule.GetMap("mntns_set")
-	fmt.Println("Mode is")
-	fmt.Println(t.config.Mode)
-	//bpfPinnedMap.Update(uint64(4026532970), uint32(123))
-	bpfConfigMap.Update(uint32(configMode), t.config.Mode)
 	bpfConfigMap.Update(uint32(configDetectOrigSyscall), boolToUInt32(t.config.DetectOriginalSyscall))
 	bpfConfigMap.Update(uint32(configExecEnv), boolToUInt32(t.config.ShowExecEnv))
-	bpfConfigMap.Update(uint32(configCaptureFiles), boolToUInt32(t.config.CaptureWrite))
-	bpfConfigMap.Update(uint32(configExtractDynCode), boolToUInt32(t.config.CaptureMem))
+	bpfConfigMap.Update(uint32(configCaptureFiles), boolToUInt32(t.config.Capture.FileWrite))
+	bpfConfigMap.Update(uint32(configExtractDynCode), boolToUInt32(t.config.Capture.Mem))
 	bpfConfigMap.Update(uint32(configTraceePid), uint32(os.Getpid()))
-
+	bpfConfigMap.Update(uint32(configStackAddresses), boolToUInt32(t.config.StackAddresses))
+	bpfConfigMap.Update(uint32(configFollowFilter), boolToUInt32(t.config.Filter.Follow))
+	bpfConfigMap.Update(uint32(configPinFilter), boolToUInt32(t.config.Pin))
 	// Initialize tail calls program array
 	bpfProgArrayMap, _ := t.bpfModule.GetMap("prog_array")
 	prog, err := t.bpfModule.GetProgram("trace_ret_vfs_write_tail")
@@ -531,8 +608,8 @@ func (t *Tracee) populateBPFMaps() error {
 
 	// Set filters given by the user to filter file write events
 	fileFilterMap, _ := t.bpfModule.GetMap("file_filter")
-	for i := 0; i < len(t.config.FilterFileWrite); i++ {
-		fileFilterMap.Update(uint32(i), []byte(t.config.FilterFileWrite[i]))
+	for i := 0; i < len(t.config.Capture.FilterFileWrite); i++ {
+		fileFilterMap.Update(uint32(i), []byte(t.config.Capture.FilterFileWrite[i]))
 	}
 
 	err = t.setUintFilter(t.config.Filter.UIDFilter, "uid_filter", configUIDFilter, uidLess)
@@ -543,6 +620,11 @@ func (t *Tracee) populateBPFMaps() error {
 	err = t.setUintFilter(t.config.Filter.PIDFilter, "pid_filter", configPidFilter, pidLess)
 	if err != nil {
 		return fmt.Errorf("error setting pid filter: %v", err)
+	}
+
+	err = t.setBoolFilter(t.config.Filter.NewPidFilter, configNewPidFilter)
+	if err != nil {
+		return fmt.Errorf("error setting pid=new filter: %v", err)
 	}
 
 	err = t.setUintFilter(t.config.Filter.MntNSFilter, "mnt_ns_filter", configMntNsFilter, mntNsLess)
@@ -565,10 +647,32 @@ func (t *Tracee) populateBPFMaps() error {
 		return fmt.Errorf("error setting comm filter: %v", err)
 	}
 
+	err = t.setBoolFilter(t.config.Filter.ContFilter, configContFilter)
+	if err != nil {
+		return fmt.Errorf("error setting cont filter: %v", err)
+	}
+
+	err = t.setBoolFilter(t.config.Filter.NewContFilter, configNewContFilter)
+	if err != nil {
+		return fmt.Errorf("error setting container=new filter: %v", err)
+	}
+
 	stringStoreMap, _ := t.bpfModule.GetMap("string_store")
 	stringStoreMap.Update(uint32(0), []byte("/dev/null"))
 
 	eventsParams := t.initEventsParams()
+
+	// After initializing event params, we can also initialize argument filters argTags
+	for eventID, eventFilters := range t.config.Filter.ArgFilter.Filters {
+		for argName, filter := range eventFilters {
+			argTag, ok := t.EncParamName[eventID%2][argName]
+			if !ok {
+				return fmt.Errorf("event argument %s for event %d was not initialized correctly", argName, eventID)
+			}
+			filter.argTag = argTag
+			eventFilters[argName] = filter
+		}
+	}
 
 	sysEnterTailsBPFMap, _ := t.bpfModule.GetMap("sys_enter_tails")
 	//sysExitTailsBPFMap := t.bpfModule.GetMap("sys_exit_tails")
@@ -649,10 +753,17 @@ func (t *Tracee) initBPF(bpfObjectPath string) error {
 		}
 	}
 
-	if t.config.NSMapPinning != "" {
-		fmt.Println("\nChanging pinning to ")
-		fmt.Println(t.config.NSMapPinning)
-		t.bpfModule.ChangeMapPin("mntns_set", t.config.NSMapPinning)
+	if t.config.PinObjectName != "" && t.config.PinObjectType != "" && t.config.PinPath != "" {
+		if t.config.PinObjectType == "map" {
+			_, err = t.bpfModule.GetMap(t.config.PinObjectName)
+			fmt.Println("Found Map")
+			fmt.Println(t.config.PinObjectName)
+			if err != nil {
+				return err
+			}
+			t.bpfModule.PinMap(t.config.PinObjectName, t.config.PinPath)
+			t.config.Pin = true
+		}
 	}
 
 	err = t.bpfModule.BPFLoadObject()
@@ -686,10 +797,16 @@ func (t *Tracee) initBPF(bpfObjectPath string) error {
 			switch probe.attach {
 			case kprobe:
 				// todo: after updating minimal kernel version to 4.18, use without legacy
-				_, err = prog.AttachKprobe(probe.event)
+				_, err = prog.AttachKprobeLegacy(probe.event)
+				if err != nil {
+					_, err = prog.AttachKprobe(probe.event)
+				}
 			case kretprobe:
 				// todo: after updating minimal kernel version to 4.18, use without legacy
-				_, err = prog.AttachKretprobe(probe.event)
+				_, err = prog.AttachKretprobeLegacy(probe.event)
+				if err != nil {
+					_, err = prog.AttachKretprobe(probe.event)
+				}
 			case tracepoint:
 				_, err = prog.AttachTracepoint(probe.event)
 			case rawTracepoint:
@@ -735,6 +852,33 @@ func (t *Tracee) Run() error {
 	t.eventsPerfMap.Stop()
 	t.fileWrPerfMap.Stop()
 	t.printer.Epilogue(t.stats)
+
+	// record index of written files
+	if t.config.Capture.FileWrite {
+		destinationFilePath := filepath.Join(t.config.Capture.OutputPath, "written_files")
+		f, err := os.OpenFile(destinationFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("error logging written files")
+		}
+		defer f.Close()
+		for fileName, filePath := range t.writtenFiles {
+			writeFiltered := false
+			for _, filterPrefix := range t.config.Capture.FilterFileWrite {
+				if !strings.HasPrefix(filePath, filterPrefix) {
+					writeFiltered = true
+					break
+				}
+			}
+			if writeFiltered {
+				// Don't write mapping of files that were not actually captured
+				continue
+			}
+			if _, err := f.WriteString(fmt.Sprintf("%s %s\n", fileName, filePath)); err != nil {
+				return fmt.Errorf("error logging written files")
+			}
+		}
+	}
+
 	// Signal pipeline that Tracee exits by closing the done channel
 	close(done)
 	t.Close()
@@ -788,11 +932,69 @@ func (t *Tracee) handleError(err error) {
 
 // shouldProcessEvent decides whether or not to drop an event before further processing it
 func (t *Tracee) shouldProcessEvent(e RawEvent) bool {
+	if t.config.Filter.ArgFilter.Enabled {
+		for _, filter := range t.config.Filter.ArgFilter.Filters[e.Ctx.EventID] {
+			argVal, ok := e.RawArgs[filter.argTag]
+			if !ok {
+				continue
+			}
+			// TODO: use type assertion instead of string convertion
+			argValStr := fmt.Sprint(argVal)
+			match := false
+			for _, f := range filter.Equal {
+				if argValStr == f || (f[len(f)-1] == '*' && strings.HasPrefix(argValStr, f[0:len(f)-1])) {
+					match = true
+					break
+				}
+			}
+			if !match && len(filter.Equal) > 0 {
+				return false
+			}
+			for _, f := range filter.NotEqual {
+				if argValStr == f || (f[len(f)-1] == '*' && strings.HasPrefix(argValStr, f[0:len(f)-1])) {
+					return false
+				}
+			}
+		}
+	}
+
 	return true
 }
 
 func (t *Tracee) processEvent(ctx *context, args map[argTag]interface{}) error {
 	switch ctx.EventID {
+
+	//capture written files
+	case VfsWriteEventID, VfsWritevEventID:
+		if t.config.Capture.FileWrite {
+			filePath, ok := args[t.EncParamName[ctx.EventID%2]["pathname"]].(string)
+			if !ok {
+				return fmt.Errorf("error parsing vfs_write args")
+			}
+			// path should be absolute, except for e.g memfd_create files
+			if filePath == "" || filePath[0] != '/' {
+				return nil
+			}
+			dev, ok := args[t.EncParamName[ctx.EventID%2]["dev"]].(uint32)
+			if !ok {
+				return fmt.Errorf("error parsing vfs_write args")
+			}
+			inode, ok := args[t.EncParamName[ctx.EventID%2]["inode"]].(uint64)
+			if !ok {
+				return fmt.Errorf("error parsing vfs_write args")
+			}
+
+			// stop processing if write was already indexed
+			fileName := fmt.Sprintf("write.dev-%d.inode-%d", dev, inode)
+			indexName, ok := t.writtenFiles[fileName]
+			if ok && indexName == filePath {
+				return nil
+			}
+
+			// index written file by original filepath
+			t.writtenFiles[fileName] = filePath
+		}
+
 	case SecurityBprmCheckEventID:
 
 		//cache this pid by it's mnt ns
@@ -803,7 +1005,7 @@ func (t *Tracee) processEvent(ctx *context, args map[argTag]interface{}) error {
 		}
 
 		//capture executed files
-		if t.config.CaptureExec {
+		if t.config.Capture.Exec {
 			filePath, ok := args[t.EncParamName[ctx.EventID%2]["pathname"]].(string)
 			if !ok {
 				return fmt.Errorf("error parsing security_bprm_check args")
@@ -813,7 +1015,7 @@ func (t *Tracee) processEvent(ctx *context, args map[argTag]interface{}) error {
 				return nil
 			}
 
-			destinationDirPath := filepath.Join(t.config.OutputPath, strconv.Itoa(int(ctx.MntID)))
+			destinationDirPath := filepath.Join(t.config.Capture.OutputPath, strconv.Itoa(int(ctx.MntID)))
 			if err := os.MkdirAll(destinationDirPath, 0755); err != nil {
 				return err
 			}
@@ -962,6 +1164,8 @@ func (t *Tracee) prepareArgsForPrint(ctx *context, args map[argTag]interface{}) 
 
 // context struct contains common metadata that is collected for all types of events
 // it is used to unmarshal binary data and therefore should match (bit by bit) to the `context_t` struct in the ebpf code.
+// NOTE: Integers want to be aligned in memory, so if changing the format of this struct
+// keep the 1-byte 'Argnum' as the final parameter before the padding (if padding is needed).
 type context struct {
 	Ts       uint64
 	Pid      uint32
@@ -977,8 +1181,9 @@ type context struct {
 	UtsName  [16]byte
 	EventID  int32
 	Retval   int64
+	StackID  uint32
 	Argnum   uint8
-	_        [7]byte //padding
+	_        [3]byte //padding
 }
 
 func (t *Tracee) processLostEvents() {
@@ -1041,7 +1246,7 @@ func (t *Tracee) processFileWrites() {
 				continue
 			}
 
-			pathname := path.Join(t.config.OutputPath, strconv.Itoa(int(meta.MntID)))
+			pathname := path.Join(t.config.Capture.OutputPath, strconv.Itoa(int(meta.MntID)))
 			if err := os.MkdirAll(pathname, 0755); err != nil {
 				t.handleError(err)
 				continue

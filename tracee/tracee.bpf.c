@@ -47,8 +47,10 @@
 #define MAX_PERCPU_BUFSIZE  (1 << 15)     // This value is actually set by the kernel as an upper bound
 #define MAX_STRING_SIZE     4096          // Choosing this value to be the same as PATH_MAX
 #define MAX_STR_ARR_ELEM    40            // String array elements number should be bounded due to instructions limit
-#define MAX_PATH_PREF_SIZE  64            // Max path prefix should be bounded due to instructions limit
-#define MAX_STR_FILTER_SIZE 16            // Max string filter size should be bounded due to instructions limit
+#define MAX_PATH_PREF_SIZE  50            // Max path prefix should be bounded due to instructions limit
+#define MAX_STACK_ADDRESSES 1024          // Max amount of different stack trace addresses to buffer in the Map
+#define MAX_STACK_DEPTH     20            // Max depth of each stack trace to track
+#define MAX_STR_FILTER_SIZE 16            // Max string filter size should be bounded to the size of the compared values (comm, uts)
 
 #define SUBMIT_BUF_IDX      0
 #define STRING_BUF_IDX      1
@@ -128,19 +130,23 @@
 #define SCHED_PROCESS_EXIT    1010
 #define MAX_EVENT_ID          1011
 
-#define CONFIG_MODE             0
-#define CONFIG_SHOW_SYSCALL     1
-#define CONFIG_EXEC_ENV         2
-#define CONFIG_CAPTURE_FILES    3
-#define CONFIG_EXTRACT_DYN_CODE 4
-#define CONFIG_TRACEE_PID       5
-#define CONFIG_UID_FILTER       6
-#define CONFIG_MNT_NS_FILTER    7
-#define CONFIG_PID_NS_FILTER    8
-#define CONFIG_UTS_NS_FILTER    9
-#define CONFIG_COMM_FILTER      10
-#define CONFIG_PID_FILTER       11
-
+#define CONFIG_SHOW_SYSCALL         1
+#define CONFIG_EXEC_ENV             2
+#define CONFIG_CAPTURE_FILES        3
+#define CONFIG_EXTRACT_DYN_CODE     4
+#define CONFIG_TRACEE_PID           5
+#define CONFIG_CAPTURE_STACK_TRACES 6
+#define CONFIG_UID_FILTER           7
+#define CONFIG_MNT_NS_FILTER        8
+#define CONFIG_PID_NS_FILTER        9
+#define CONFIG_UTS_NS_FILTER        10
+#define CONFIG_COMM_FILTER          11
+#define CONFIG_PID_FILTER           12
+#define CONFIG_CONT_FILTER          13
+#define CONFIG_FOLLOW_FILTER        14
+#define CONFIG_NEW_PID_FILTER       15
+#define CONFIG_NEW_CONT_FILTER      16
+#define CONFIG_PIN_FILTER           17
 
 // get_config(CONFIG_XXX_FILTER) returns 0 if not enabled
 #define FILTER_IN  1
@@ -157,15 +163,6 @@
 
 #define LESS_NOT_SET    0
 #define GREATER_NOT_SET ULLONG_MAX
-
-#define MODE_PROCESS_ALL        1
-#define MODE_PROCESS_NEW        2
-#define MODE_PROCESS_FOLLOW     3
-#define MODE_CONTAINER_ALL      4
-#define MODE_CONTAINER_NEW      5
-#define MODE_HOST_ALL           6
-#define MODE_HOST_NEW           7
-#define MODE_MAP_PINNED         8
 
 #define DEV_NULL_STR    0
 
@@ -198,6 +195,17 @@ BPF_MAP(_name, BPF_MAP_TYPE_PROG_ARRAY, u32, u32, _max_entries);
 #define BPF_PERF_OUTPUT(_name) \
 BPF_MAP(_name, BPF_MAP_TYPE_PERF_EVENT_ARRAY, int, __u32, 1024);
 
+// Stack Traces are slightly different
+// in that the value is 1 big byte array
+// of the stack addresses
+#define BPF_STACK_TRACE(_name, _max_entries) \
+struct bpf_map_def SEC("maps") _name = { \
+  .type = BPF_MAP_TYPE_STACK_TRACE, \
+  .key_size = sizeof(u32), \
+  .value_size = sizeof(size_t) * MAX_STACK_DEPTH, \
+  .max_entries = _max_entries, \
+};
+
 #ifdef RHEL_RELEASE_CODE
 #if (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(8, 0))
 #define RHEL_RELEASE_GT_8_0
@@ -225,6 +233,7 @@ typedef struct context {
     char uts_name[TASK_COMM_LEN];
     u32 eventid;
     s64 retval;
+    u32 stack_id;
     u8 argnum;
 } context_t;
 
@@ -285,38 +294,42 @@ struct mount {
 
 /*=================================== MAPS =====================================*/
 
-BPF_HASH(config_map, u32, u32);                     // Various configurations
-BPF_HASH(chosen_events_map, u32, u32);              // Events chosen by the user
-BPF_HASH(pids_map, u32, u32);                       // Save traced pids or container pid namespaces ids
-BPF_HASH(args_map, u64, args_t);                    // Persist args info between function entry and return
-BPF_HASH(ret_map, u64, u64);                        // Persist return value to be used in tail calls
-BPF_HASH(inequality_filter, u32, u64);              // Used to filter events by some uint field either by < or >
-BPF_HASH(uid_filter, u32, u32);                     // Used to filter events by UID, for specific UIDs either by == or !=
-BPF_HASH(pid_filter, u32, u32);                     // Used to filter events by PID
-BPF_HASH(mnt_ns_filter, u64, u32);                  // Used to filter events by mount namespace id
-BPF_HASH(pid_ns_filter, u64, u32);                  // Used to filter events by pid namespace id
-BPF_HASH(uts_ns_filter, string_filter_t, u32);      // Used to filter events by uts namespace name
-BPF_HASH(comm_filter, string_filter_t, u32);        // Used to filter events by command name
-BPF_HASH(bin_args_map, u64, bin_args_t);            // Persist args for send_bin funtion
-BPF_HASH(sys_32_to_64_map, u32, u32);               // Map 32bit syscalls numbers to 64bit syscalls numbers
-BPF_HASH(params_types_map, u32, u64);               // Encoded parameters types for event
-BPF_HASH(params_names_map, u32, u64);               // Encoded parameters names for event
-BPF_ARRAY(file_filter, path_filter_t, 3);           // Used to filter vfs_write events
-BPF_ARRAY(string_store, path_filter_t, 1);          // Store strings from userspace
-BPF_PERCPU_ARRAY(bufs, buf_t, MAX_BUFFERS);         // Percpu global buffer variables
-BPF_PERCPU_ARRAY(bufs_off, u32, MAX_BUFFERS);       // Holds offsets to bufs respectively
-BPF_PROG_ARRAY(prog_array, MAX_TAIL_CALL);          // Used to store programs for tail calls
-BPF_PROG_ARRAY(sys_enter_tails, MAX_EVENT_ID);      // Used to store programs for tail calls
-BPF_PROG_ARRAY(sys_exit_tails, MAX_EVENT_ID);       // Used to store programs for tail calls
+BPF_HASH(config_map, u32, u32);                         // Various configurations
+BPF_HASH(chosen_events_map, u32, u32);                  // Events chosen by the user
+BPF_HASH(traced_pids_map, u32, u32);                    // Keep track of traced pids
+BPF_HASH(new_pids_map, u32, u32);                       // Keep track of the processes of newly executed binaries
+BPF_HASH(new_pidns_map, u32, u32);                      // Keep track of new pid namespaces
+BPF_HASH(args_map, u64, args_t);                        // Persist args info between function entry and return
+BPF_HASH(ret_map, u64, u64);                            // Persist return value to be used in tail calls
+BPF_HASH(inequality_filter, u32, u64);                  // Used to filter events by some uint field either by < or >
+BPF_HASH(uid_filter, u32, u32);                         // Used to filter events by UID, for specific UIDs either by == or !=
+BPF_HASH(pid_filter, u32, u32);                         // Used to filter events by PID
+BPF_HASH(mnt_ns_filter, u64, u32);                      // Used to filter events by mount namespace id
+BPF_HASH(pid_ns_filter, u64, u32);                      // Used to filter events by pid namespace id
+BPF_HASH(uts_ns_filter, string_filter_t, u32);          // Used to filter events by uts namespace name
+BPF_HASH(comm_filter, string_filter_t, u32);            // Used to filter events by command name
+BPF_HASH(bin_args_map, u64, bin_args_t);                // Persist args for send_bin funtion
+BPF_HASH(sys_32_to_64_map, u32, u32);                   // Map 32bit syscalls numbers to 64bit syscalls numbers
+BPF_HASH(params_types_map, u32, u64);                   // Encoded parameters types for event
+BPF_HASH(params_names_map, u32, u64);                   // Encoded parameters names for event
+BPF_ARRAY(file_filter, path_filter_t, 3);               // Used to filter vfs_write events
+BPF_ARRAY(string_store, path_filter_t, 1);              // Store strings from userspace
+BPF_PERCPU_ARRAY(bufs, buf_t, MAX_BUFFERS);             // Percpu global buffer variables
+BPF_PERCPU_ARRAY(bufs_off, u32, MAX_BUFFERS);           // Holds offsets to bufs respectively
+BPF_PROG_ARRAY(prog_array, MAX_TAIL_CALL);              // Used to store programs for tail calls
+BPF_PROG_ARRAY(sys_enter_tails, MAX_EVENT_ID);          // Used to store programs for tail calls
+BPF_PROG_ARRAY(sys_exit_tails, MAX_EVENT_ID);           // Used to store programs for tail calls
+BPF_STACK_TRACE(stack_addresses, MAX_STACK_ADDRESSES);  // Used to store stack traces
+//We are not using this, this is just for testing
+
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 128);
+	__uint(max_entries, 10240);
 	__type(key, __u64);
 	__type(value, __u32);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} mntns_set SEC(".maps"); //map where mnt ns ids to filter are stored, we use this definition because it allows us to have pinning
-
+} mntns_set SEC(".maps");
 /*================================== EVENTS ====================================*/
 
 BPF_PERF_OUTPUT(events);                            // Events submission
@@ -388,7 +401,11 @@ static __always_inline u32 get_task_ppid(struct task_struct *task)
 static __always_inline bool is_x86_compat(struct task_struct *task)
 {
 #if defined(bpf_target_x86)
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 18))
+    return READ_KERN(task->thread.status) & TS_COMPAT;
+#else
     return READ_KERN(task->thread_info.status) & TS_COMPAT;
+#endif
 #else
     return false;
 #endif
@@ -535,6 +552,9 @@ static __always_inline int init_context(context_t *context)
     // Save timestamp in microsecond resolution
     context->ts = bpf_ktime_get_ns()/1000;
 
+    // Clean Stack Trace ID
+    context->stack_id = 0;
+
     return 0;
 }
 
@@ -599,65 +619,61 @@ static __always_inline int equality_filter_matches(int filter_config, void *filt
     return 1;
 }
 
-static __always_inline int mnt_id_filter_matches(u32 mnt_id)
+static __always_inline int bool_filter_matches(int filter_config, bool val)
 {
+    int config = get_config(filter_config);
+    if (!config)
+        return 1;
+
+    if ((config == FILTER_IN) && val){
+        return 1;
+    }
+
+    if ((config == FILTER_OUT) && !val) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static __always_inline int mnt_id_filter_matches(u64 mnt_id) {
     u64 mnt_id_curr = (u64)mnt_id;
     uid_t* isMatch = bpf_map_lookup_elem(&mntns_set, &mnt_id_curr); 
     if (isMatch == NULL) {      
         return 0;    
    }
-   bpf_printk("\nWe passed\n");
     return 1;
 }
+
 
 static __always_inline int should_trace()
 {
     context_t context = {};
     init_context(&context);
- 
-
-   // if (!mnt_id_filter_matches(context.mnt_id)) {
-   //     return 0;
-   // }
-
-    
-    switch (get_config(CONFIG_MODE))
-    {
-        case MODE_MAP_PINNED:
-            //bpf_printk("\nYes we are here\n");
-            if (mnt_id_filter_matches(context.mnt_id)) {
+    if (get_config(CONFIG_PIN_FILTER)) {
+        if (mnt_id_filter_matches(context.mnt_id)) {
                 return 1;
             } else {
                 return 0;
             }
-        case MODE_PROCESS_NEW:
-            if (bpf_map_lookup_elem(&pids_map, &context.host_tid) == 0)
-                return 0;
-            break;
-        case MODE_PROCESS_FOLLOW:
-            if (bpf_map_lookup_elem(&pids_map, &context.host_tid) != 0) {
-                return 1;
-            }
-            break;
-        case MODE_CONTAINER_NEW:
-            if (bpf_map_lookup_elem(&pids_map, &context.pid_id) == 0)
-                return 0;
-            break;
-        case MODE_CONTAINER_ALL:
-            if (context.tid == context.host_tid) {
-                return 0;
-            }
-            break;
-        case MODE_HOST_ALL:
-            if (context.tid != context.host_tid) {
-                return 0;
-            }
-            break;
-        case MODE_HOST_NEW:
-            if ((context.tid != context.host_tid) || (bpf_map_lookup_elem(&pids_map, &context.host_tid) == 0)) {
-                return 0;
-            }
-            break;
+    }
+
+    if (get_config(CONFIG_FOLLOW_FILTER)) {
+        if (bpf_map_lookup_elem(&traced_pids_map, &context.host_tid) != 0)
+            // If the process is already in the traced_pids_map and follow was chosen, don't check the other filters
+            return 1;
+    }
+
+    bool is_new_pid = bpf_map_lookup_elem(&new_pids_map, &context.host_tid) != 0;
+    if (!bool_filter_matches(CONFIG_NEW_PID_FILTER, is_new_pid))
+    {
+        return 0;
+    }
+
+    bool is_new_container = bpf_map_lookup_elem(&new_pidns_map, &context.pid_id) != 0;
+    if (!bool_filter_matches(CONFIG_NEW_CONT_FILTER, is_new_container))
+    {
+        return 0;
     }
 
     // Don't monitor self
@@ -694,11 +710,15 @@ static __always_inline int should_trace()
     {
         return 0;
     }
-    
-     // We passed all filters successfully
-    return 1;
+    // TODO: after we move to minimal kernel 4.18, we can check for container by cgroupid != host cgroupid
+    bool is_container = context.tid != context.host_tid;
+    if (!bool_filter_matches(CONFIG_CONT_FILTER, is_container))
+    {
+        return 0;
+    }
 
-    
+    // We passed all filters successfully
+    return 1;
 }
 
 static __always_inline int event_chosen(u32 key)
@@ -736,15 +756,23 @@ static __always_inline int save_context_to_buf(buf_t *submit_p, void *ptr)
     return 0;
 }
 
-static __always_inline context_t init_and_save_context(buf_t *submit_p, u32 id, u8 argnum, long ret)
+static __always_inline context_t init_and_save_context(void* ctx, buf_t *submit_p, u32 id, u8 argnum, long ret)
 {
     context_t context = {};
     init_context(&context);
     context.eventid = id;
     context.argnum = argnum;
     context.retval = ret;
-    save_context_to_buf(submit_p, (void*)&context);
 
+    // Get Stack trace
+    if (get_config(CONFIG_CAPTURE_STACK_TRACES)) {
+        int stack_id = bpf_get_stackid(ctx, &stack_addresses, BPF_F_USER_STACK);
+        if (stack_id >= 0) {
+            context.stack_id = stack_id;
+        }
+    }
+
+    save_context_to_buf(submit_p, (void*)&context);
     return context;
 }
 
@@ -1280,7 +1308,7 @@ static __always_inline int trace_ret_generic(void *ctx, u32 id, u64 types, u64 t
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
     u8 argnum = save_args_to_submit_buf(types, tags, args);
-    init_and_save_context(submit_p, id, argnum, ret);
+    init_and_save_context(ctx, submit_p, id, argnum, ret);
 
     events_perf_submit(ctx);
     return 0;
@@ -1386,31 +1414,30 @@ struct bpf_raw_tracepoint_args *ctx
 
         id = *id_64;
     }
-    int config_mode = get_config(CONFIG_MODE);
+
     u32 pid = bpf_get_current_pid_tgid();
 
     // execve events may add new pids to the traced pids set
     // perform this check before should_trace() so newly executed binaries will be traced
     if (id == SYS_EXECVE || id == SYS_EXECVEAT) {
-        if (config_mode == MODE_CONTAINER_NEW) {
+        if (get_config(CONFIG_NEW_CONT_FILTER)) {
             u32 pid_ns = get_task_pid_ns_id(task);
-            if ((bpf_map_lookup_elem(&pids_map, &pid_ns) == 0) && (get_task_ns_pid(task) == 1)) {
+            if (get_task_ns_pid(task) == 1) {
                 // A new container/pod was started (pid 1 in namespace executed) - add pid namespace to map
-                bpf_map_update_elem(&pids_map, &pid_ns, &pid_ns, BPF_ANY);
+                bpf_map_update_elem(&new_pidns_map, &pid_ns, &pid_ns, BPF_ANY);
             }
-        } else if (config_mode == MODE_PROCESS_NEW || config_mode == MODE_PROCESS_ALL || config_mode == MODE_HOST_ALL || config_mode == MODE_HOST_NEW) {
-            if (bpf_map_lookup_elem(&pids_map, &pid) == 0)
-                bpf_map_update_elem(&pids_map, &pid, &pid, BPF_ANY);
+        }
+        if (get_config(CONFIG_NEW_PID_FILTER)) {
+            bpf_map_update_elem(&new_pids_map, &pid, &pid, BPF_ANY);
         }
     }
-    
+
     if (!should_trace())
         return 0;
 
-    if ((id == SYS_EXECVE || id == SYS_EXECVEAT) && (config_mode == MODE_PROCESS_FOLLOW))
-    {
+    if (id == SYS_EXECVE || id == SYS_EXECVEAT) {
         // We passed all filters (in should_trace()) - add this pid to traced pids set
-        bpf_map_update_elem(&pids_map, &pid, &pid, BPF_ANY);
+        bpf_map_update_elem(&traced_pids_map, &pid, &pid, BPF_ANY);
     }
 
     if (event_chosen(RAW_SYS_ENTER)) {
@@ -1419,7 +1446,7 @@ struct bpf_raw_tracepoint_args *ctx
             return 0;
         set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-        context_t context = init_and_save_context(submit_p, RAW_SYS_ENTER, 1 /*argnum*/, 0 /*ret*/);
+        context_t context = init_and_save_context(ctx, submit_p, RAW_SYS_ENTER, 1 /*argnum*/, 0 /*ret*/);
 
         u64 *tags = bpf_map_lookup_elem(&params_names_map, &context.eventid);
         if (!tags) {
@@ -1492,9 +1519,10 @@ struct bpf_raw_tracepoint_args *ctx
     // fork events may add new pids to the traced pids set
     // perform this check after should_trace() to only add forked childs of a traced parent
     if (id == SYS_CLONE || id == SYS_FORK || id == SYS_VFORK) {
-        if (get_config(CONFIG_MODE) != MODE_CONTAINER_ALL && get_config(CONFIG_MODE) != MODE_CONTAINER_NEW) {
-            u32 pid = ret;
-            bpf_map_update_elem(&pids_map, &pid, &pid, BPF_ANY);
+        u32 pid = ret;
+        bpf_map_update_elem(&traced_pids_map, &pid, &pid, BPF_ANY);
+        if (get_config(CONFIG_NEW_PID_FILTER)) {
+            bpf_map_update_elem(&new_pids_map, &pid, &pid, BPF_ANY);
         }
     }
 
@@ -1504,7 +1532,7 @@ struct bpf_raw_tracepoint_args *ctx
             return 0;
         set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-        context_t context = init_and_save_context(submit_p, RAW_SYS_EXIT, 1 /*argnum*/, ret);
+        context_t context = init_and_save_context(ctx, submit_p, RAW_SYS_EXIT, 1 /*argnum*/, ret);
 
         u64 *tags = bpf_map_lookup_elem(&params_names_map, &context.eventid);
         if (!tags) {
@@ -1567,7 +1595,7 @@ int syscall__execve(void *ctx)
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    context_t context = init_and_save_context(submit_p, SYS_EXECVE, 2 /*argnum*/, 0 /*ret*/);
+    context_t context = init_and_save_context(ctx, submit_p, SYS_EXECVE, 2 /*argnum*/, 0 /*ret*/);
 
     u64 *tags = bpf_map_lookup_elem(&params_names_map, &context.eventid);
     if (!tags) {
@@ -1604,7 +1632,7 @@ int syscall__execveat(void *ctx)
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    context_t context = init_and_save_context(submit_p, SYS_EXECVEAT, 4 /*argnum*/, 0 /*ret*/);
+    context_t context = init_and_save_context(ctx, submit_p, SYS_EXECVEAT, 4 /*argnum*/, 0 /*ret*/);
 
     u64 *tags = bpf_map_lookup_elem(&params_names_map, &context.eventid);
     if (!tags) {
@@ -1639,21 +1667,23 @@ struct bpf_raw_tracepoint_args *ctx
     if (!should_trace())
         return 0;
 
-    if (get_config(CONFIG_MODE) == MODE_CONTAINER_NEW) {
+    u32 pid = bpf_get_current_pid_tgid();
+    // Remove pid from traced_pids_map
+    bpf_map_delete_elem(&traced_pids_map, &pid);
+
+    if (get_config(CONFIG_NEW_CONT_FILTER)) {
         struct task_struct *task;
         task = (struct task_struct *)bpf_get_current_task();
 
         u32 pid_ns = get_task_pid_ns_id(task);
-        if ((bpf_map_lookup_elem(&pids_map, &pid_ns) != 0) && (get_task_ns_pid(task) == 1)) {
+        if (get_task_ns_pid(task) == 1) {
             // If pid equals 1 - stop tracing this pid namespace
-            bpf_map_delete_elem(&pids_map, &pid_ns);
+            bpf_map_delete_elem(&new_pidns_map, &pid_ns);
         }
     }
-    else {
-        // Remove pid from pids_map
-        u32 pid = bpf_get_current_pid_tgid();
-        if (bpf_map_lookup_elem(&pids_map, &pid) != 0)
-            bpf_map_delete_elem(&pids_map, &pid);
+    if (get_config(CONFIG_NEW_PID_FILTER)) {
+        // Remove pid from new_pids_map
+        bpf_map_delete_elem(&new_pids_map, &pid);
     }
 
     buf_t *submit_p = get_buf(SUBMIT_BUF_IDX);
@@ -1661,7 +1691,7 @@ struct bpf_raw_tracepoint_args *ctx
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    init_and_save_context(submit_p, SCHED_PROCESS_EXIT, 0, 0);
+    init_and_save_context(ctx, submit_p, SCHED_PROCESS_EXIT, 0, 0);
 
     events_perf_submit(ctx);
     return 0;
@@ -1680,7 +1710,7 @@ int BPF_KPROBE(trace_do_exit)
 
     long code = PT_REGS_PARM1(ctx);
 
-    init_and_save_context(submit_p, DO_EXIT, 0, code);
+    init_and_save_context(ctx, submit_p, DO_EXIT, 0, code);
 
     events_perf_submit(ctx);
     return 0;
@@ -1697,7 +1727,7 @@ int BPF_KPROBE(trace_security_bprm_check)
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    context_t context = init_and_save_context(submit_p, SECURITY_BPRM_CHECK, 3 /*argnum*/, 0 /*ret*/);
+    context_t context = init_and_save_context(ctx, submit_p, SECURITY_BPRM_CHECK, 3 /*argnum*/, 0 /*ret*/);
 
     struct linux_binprm *bprm = (struct linux_binprm *)PT_REGS_PARM1(ctx);
     struct file* file = get_file_ptr_from_bprm(bprm);
@@ -1737,7 +1767,7 @@ int BPF_KPROBE(trace_security_file_open)
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    context_t context = init_and_save_context(submit_p, SECURITY_FILE_OPEN, 4 /*argnum*/, 0 /*ret*/);
+    context_t context = init_and_save_context(ctx, submit_p, SECURITY_FILE_OPEN, 4 /*argnum*/, 0 /*ret*/);
 
     struct file *file = (struct file *)PT_REGS_PARM1(ctx);
     dev_t s_dev = get_dev_from_file(file);
@@ -1782,7 +1812,7 @@ int BPF_KPROBE(trace_security_inode_unlink)
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    context_t context = init_and_save_context(submit_p, SECURITY_INODE_UNLINK, 1 /*argnum*/, 0 /*ret*/);
+    context_t context = init_and_save_context(ctx, submit_p, SECURITY_INODE_UNLINK, 1 /*argnum*/, 0 /*ret*/);
 
     //struct inode *dir = (struct inode *)PT_REGS_PARM1(ctx);
     struct dentry *dentry = (struct dentry *)PT_REGS_PARM2(ctx);
@@ -1820,7 +1850,7 @@ int BPF_KPROBE(trace_cap_capable)
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    context_t context = init_and_save_context(submit_p, CAP_CAPABLE, 1 /*argnum*/, 0 /*ret*/);
+    context_t context = init_and_save_context(ctx, submit_p, CAP_CAPABLE, 1 /*argnum*/, 0 /*ret*/);
 
     //const struct cred *cred = (const struct cred *)PT_REGS_PARM1(ctx);
     //struct user_namespace *targ_ns = (struct user_namespace *)PT_REGS_PARM2(ctx);
@@ -1973,6 +2003,7 @@ static __always_inline int do_vfs_write_writev(struct pt_regs *ctx, u32 event_id
 {
     args_t saved_args;
     bool has_filter = false;
+    bool filter_match = false;
 
     bool delete_args = false;
     if (load_args(&saved_args, delete_args, event_id) != 0) {
@@ -1991,6 +2022,7 @@ static __always_inline int do_vfs_write_writev(struct pt_regs *ctx, u32 event_id
     if (off == NULL)
         return -1;
 
+    // Check if capture write was requested for this path
     #pragma unroll
     for (int i = 0; i < 3; i++) {
         int idx = i;
@@ -2006,17 +2038,67 @@ static __always_inline int do_vfs_write_writev(struct pt_regs *ctx, u32 event_id
         if (*off > MAX_PERCPU_BUFSIZE - MAX_STRING_SIZE)
             break;
 
-        if (has_prefix(filter_p->path, &string_p->buf[*off], MAX_PATH_PREF_SIZE))
-            bpf_tail_call(ctx, &prog_array, tail_call_id);
+        if (has_prefix(filter_p->path, &string_p->buf[*off], MAX_PATH_PREF_SIZE)) {
+            filter_match = true;
+            break;
+        }
     }
 
-    if (has_filter) {
+    // Submit vfs_write(v) event if it was chosen, or in case of a filter match (so we can get written_files metadata)
+    if (event_chosen(VFS_WRITE) || event_chosen(VFS_WRITEV) || filter_match) {
+        loff_t start_pos;
+        size_t count;
+        unsigned long vlen;
+
+        buf_t *submit_p = get_buf(SUBMIT_BUF_IDX);
+        if (submit_p == NULL)
+            return 0;
+        set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
+
+        init_and_save_context(ctx, submit_p, event_id, 5 /*argnum*/, PT_REGS_RC(ctx));
+
+        if (event_id == VFS_WRITE) {
+            count              = (size_t)        saved_args.args[2];
+        } else {
+            vlen               =                 saved_args.args[2];
+        }
+        loff_t *pos            = (loff_t*)       saved_args.args[3];
+
+        // Extract device id, inode number, and pos (offset)
+        dev_t s_dev = get_dev_from_file(file);
+        unsigned long inode_nr = get_inode_nr_from_file(file);
+        bpf_probe_read(&start_pos, sizeof(off_t), pos);
+
+        // Calculate write start offset
+        if (start_pos != 0)
+            start_pos -= PT_REGS_RC(ctx);
+
+        u64 *tags = bpf_map_lookup_elem(&params_names_map, &event_id);
+        if (!tags) {
+            return -1;
+        }
+
+        save_str_to_buf(submit_p, (void *)&string_p->buf[*off], DEC_ARG(0, *tags));
+        save_to_submit_buf(submit_p, &s_dev, sizeof(dev_t), DEV_T_T, DEC_ARG(1, *tags));
+        save_to_submit_buf(submit_p, &inode_nr, sizeof(unsigned long), ULONG_T, DEC_ARG(2, *tags));
+
+        if (event_id == VFS_WRITE)
+            save_to_submit_buf(submit_p, &count, sizeof(size_t), SIZE_T_T, DEC_ARG(3, *tags));
+        else
+            save_to_submit_buf(submit_p, &vlen, sizeof(unsigned long), ULONG_T, DEC_ARG(3, *tags));
+        save_to_submit_buf(submit_p, &start_pos, sizeof(off_t), OFF_T_T, DEC_ARG(4, *tags));
+
+        // Submit vfs_write(v) event
+        events_perf_submit(ctx);
+    }
+
+    if (has_filter && !filter_match) {
         // There is a filter, but no match
         del_args(event_id);
         return 0;
     }
 
-    // No filter was given - continue
+    // No filter was given, or filter match - continue
     bpf_tail_call(ctx, &prog_array, tail_call_id);
     return 0;
 }
@@ -2037,7 +2119,7 @@ static __always_inline int do_vfs_write_writev_tail(struct pt_regs *ctx, u32 eve
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    context_t context = init_and_save_context(submit_p, event_id, 5 /*argnum*/, PT_REGS_RC(ctx));
+    context_t context = init_and_save_context(ctx, submit_p, event_id, 5 /*argnum*/, PT_REGS_RC(ctx));
 
     bool delete_args = true;
     if (load_args(&saved_args, delete_args, event_id) != 0) {
@@ -2073,23 +2155,6 @@ static __always_inline int do_vfs_write_writev_tail(struct pt_regs *ctx, u32 eve
     // Calculate write start offset
     if (start_pos != 0)
         start_pos -= PT_REGS_RC(ctx);
-
-    u64 *tags = bpf_map_lookup_elem(&params_names_map, &context.eventid);
-    if (!tags) {
-        return -1;
-    }
-
-    save_str_to_buf(submit_p, (void *)&string_p->buf[*off], DEC_ARG(0, *tags));
-    save_to_submit_buf(submit_p, &s_dev, sizeof(dev_t), DEV_T_T, DEC_ARG(1, *tags));
-    save_to_submit_buf(submit_p, &inode_nr, sizeof(unsigned long), ULONG_T, DEC_ARG(2, *tags));
-    if (event_id == VFS_WRITE)
-        save_to_submit_buf(submit_p, &count, sizeof(size_t), SIZE_T_T, DEC_ARG(3, *tags));
-    else
-        save_to_submit_buf(submit_p, &vlen, sizeof(unsigned long), ULONG_T, DEC_ARG(3, *tags));
-    save_to_submit_buf(submit_p, &start_pos, sizeof(off_t), OFF_T_T, DEC_ARG(4, *tags));
-
-    // Submit vfs_write(v) event
-    events_perf_submit(ctx);
 
     u64 id = bpf_get_current_pid_tgid();
     u32 pid = context.pid;
@@ -2180,7 +2245,7 @@ int BPF_KPROBE(trace_mmap_alert)
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    context_t context = init_and_save_context(submit_p, MEM_PROT_ALERT, 1 /*argnum*/, 0 /*ret*/);
+    context_t context = init_and_save_context(ctx, submit_p, MEM_PROT_ALERT, 1 /*argnum*/, 0 /*ret*/);
 
     u64 *tags = bpf_map_lookup_elem(&params_names_map, &context.eventid);
     if (!tags) {
@@ -2227,7 +2292,7 @@ int BPF_KPROBE(trace_mprotect_alert)
         return 0;
     set_buf_off(SUBMIT_BUF_IDX, sizeof(context_t));
 
-    context_t context = init_and_save_context(submit_p, MEM_PROT_ALERT, 1 /*argnum*/, 0 /*ret*/);
+    context_t context = init_and_save_context(ctx, submit_p, MEM_PROT_ALERT, 1 /*argnum*/, 0 /*ret*/);
 
     u64 *tags = bpf_map_lookup_elem(&params_names_map, &context.eventid);
     if (!tags) {

@@ -2,7 +2,7 @@
 
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/aquasecurity/tracee)](https://github.com/aquasecurity/tracee/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/aquasecurity/tracee)](https://goreportcard.com/report/github.com/aquasecurity/tracee)
-[![License](https://img.shields.io/github/license/aquasecurity/tracee)](https://github.com/aquasecurity/tracee/blob/master/LICENSE)
+[![License](https://img.shields.io/github/license/aquasecurity/tracee)](https://github.com/aquasecurity/tracee/blob/main/LICENSE)
 [![docker](https://badgen.net/docker/pulls/aquasec/tracee)](https://hub.docker.com/r/aquasec/tracee)
 
 # Tracee - Container and system tracing using eBPF
@@ -40,7 +40,7 @@ This will run Tracee with no arguments, which defaults to collecting all events 
 
 ### Setup options
 
-Tracee is made of an executable that drives the eBPF program (`tracee`), and the eBPF program itself (`tracee.bpf.$kernelversion.$traceeversion.o`). When the `tracee` executable is started, it will look for the eBPF program next to the executable, or in `/tmp/tracee`, or in a directory specified in `TRACEE_BPF_FILE` environment variable. If the eBPF program is not found, the executable will attempt to build it automatically before it starts (you can control this using the `--build-policy` flag).
+Tracee is made of an executable that drives the eBPF program (`tracee`), and the eBPF program itself (`tracee.bpf.$kernelversion.$traceeversion.o`). When the `tracee` executable is started, it will look for the eBPF program next to the executable, or in `/tmp/tracee`, or in a path specified in `TRACEE_BPF_FILE` environment variable. If the eBPF program is not found, the executable will attempt to build it automatically before it starts (you can control this using the `--build-policy` flag).
 
 The easiest way to get started is to let the `tracee` executable build the eBPF program for you automatically. You can obtain the executable in any of the following ways:
 1. Download from the [GitHub Releases](https://github.com/aquasecurity/tracee/releases) (`tracee.tar.gz`).
@@ -63,7 +63,7 @@ If running in a container, regardless if it's the full or slim image, it's advis
 
 When using the `--capture exec` option, Tracee needs access to the host PID namespace. For Docker, add `--pid=host` to the run command.
 
-If you are building the eBPF program in a container, you'll need to make the kernel headers available in the container. The quickstart example has wide mounts that works in a variety of cases, for demonstration purposes. If you want, you can narrow those mounts down to a directory that contains the headers on your setup, for example: `-v /path/to/headers:/myheaders -e KERN_SRC=/myheaders`. As mentioned before, a better practice for production is to pre-compile the eBPF program, in which case the kernel headers are not needed at runtime.
+If you are building the eBPF program in a container, you'll need to make the kernel headers available in the container. The quickstart example has wide mounts that works in a variety of cases, for demonstration purposes. If you want, you can narrow those mounts down to a directory that contains the headers on your setup, for example: `-v /path/to/headers:/myheaders -e KERN_HEADERS=/myheaders`. As mentioned before, a better practice for production is to pre-compile the eBPF program, in which case the kernel headers are not needed at runtime.
 
 #### Permissions
 
@@ -128,14 +128,14 @@ Option | Flag(s):
 Trace new processes (default) | no `--trace` flag, `--trace p`, `--trace process` or `--trace process:new`
 Trace existing and new processes | `--trace process:all`
 Trace specific PIDs | `--trace process:<pid>,<pid2>,...` or `--trace p:<pid>,<pid2>,...`
+Trace filtered process and all of its children | `--trace process:follow`
 Trace new containers | `--trace c`, `--trace container` or `--trace container:new`
 Trace existing and new containers | `--trace container:all`
+Trace new processes not in a container | `--trace h`, `--trace host` or `--trace host:new`
+Trace all processes not in a container | `--trace host:all`
 
 You can also use `-t` e.g. `-t p:all`
 
 ## Secure tracing
 
 When Tracee reads information from user programs it is subject to a race condition where the user program might be able to change the arguments after Tracee has read them. For example, a program invoked `execve("/bin/ls", NULL, 0)`, Tracee picked that up and will report that, then the program changed the first argument from `/bin/ls` to `/bin/bash`, and this is what the kernel will execute. To mitigate this, Tracee also provide "LSM" (Linux Security Module) based events, for example, the `bprm_check` event which can be reported by tracee and cross-referenced with the reported regular syscall event.
-
-## Mount space filtering
-Currently tracee is able track the events in specific namespaces. There are two different ways to do it. If you need to track the event in one particular mount namespace, then you can pass it as an argument when you call tracee with `--mnt_ns_id` tag. If you have a list to filter for, then you can provide pinning path of  the bpf map with mount namepsaces ids as keys to tracee. This is done by creating a pinned map and then providing a pinning path to tracee via cmd argument `--mnt_ns_map`
