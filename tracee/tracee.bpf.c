@@ -146,7 +146,6 @@
 #define CONFIG_FOLLOW_FILTER        14
 #define CONFIG_NEW_PID_FILTER       15
 #define CONFIG_NEW_CONT_FILTER      16
-#define CONFIG_PIN_FILTER           17
 
 // get_config(CONFIG_XXX_FILTER) returns 0 if not enabled
 #define FILTER_IN  1
@@ -320,16 +319,7 @@ BPF_PROG_ARRAY(prog_array, MAX_TAIL_CALL);              // Used to store program
 BPF_PROG_ARRAY(sys_enter_tails, MAX_EVENT_ID);          // Used to store programs for tail calls
 BPF_PROG_ARRAY(sys_exit_tails, MAX_EVENT_ID);           // Used to store programs for tail calls
 BPF_STACK_TRACE(stack_addresses, MAX_STACK_ADDRESSES);  // Used to store stack traces
-//We are not using this, this is just for testing
 
-
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 10240);
-	__type(key, __u64);
-	__type(value, __u32);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} mntns_set SEC(".maps");
 /*================================== EVENTS ====================================*/
 
 BPF_PERF_OUTPUT(events);                            // Events submission
@@ -636,27 +626,10 @@ static __always_inline int bool_filter_matches(int filter_config, bool val)
     return 0;
 }
 
-static __always_inline int mnt_id_filter_matches(u64 mnt_id) {
-    u64 mnt_id_curr = (u64)mnt_id;
-    uid_t* isMatch = bpf_map_lookup_elem(&mntns_set, &mnt_id_curr); 
-    if (isMatch == NULL) {      
-        return 0;    
-   }
-    return 1;
-}
-
-
 static __always_inline int should_trace()
 {
     context_t context = {};
     init_context(&context);
-    if (get_config(CONFIG_PIN_FILTER)) {
-        if (mnt_id_filter_matches(context.mnt_id)) {
-                return 1;
-            } else {
-                return 0;
-            }
-    }
 
     if (get_config(CONFIG_FOLLOW_FILTER)) {
         if (bpf_map_lookup_elem(&traced_pids_map, &context.host_tid) != 0)

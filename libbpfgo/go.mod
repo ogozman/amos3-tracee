@@ -1,3 +1,3 @@
-module github.com/ogozman/tracee-1/libbpfgo
+module github.com/aquasecurity/tracee/libbpfgo
 
 go 1.15
