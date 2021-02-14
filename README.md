@@ -6,13 +6,13 @@
 [![docker](https://badgen.net/docker/pulls/aquasec/tracee)](https://hub.docker.com/r/aquasec/tracee)
 
 # The nature for this Fork of Tracee
-This fork of tracee has been created in order to enable tracee to pin bpf maps for with mount namespaces ids provided by inspector gadget gadget tracer manager, which allow it to trace only the event from specific mount namespaces. It is implement and functional. In order to pin map you can call tracee with new type of argument. 
+This fork of tracee has been created in order to enable tracee to pin bpf maps with mount namespace ids provided by inspector gadget gadget tracer manager, which allows it to trace only the events from specific mount namespaces. It is implemented and functional. In order to pin map you can call tracee with new type of argument. 
 
 ```bash
 tracee --pin map:mnt_ns_filter:/path/to/map
 ```
 
-This form of argument has been chose in order leave possibility of updating tracee to pin other bpf maps which are used to store filtering options in tracee or even other bpf objects. Currently, however, the option for map mnt_ns_filter is available.
+This form of argument has been chosen in order leave possibility of updating tracee to pin other bpf maps which are used to store filtering options in tracee or even other bpf objects. Currently, however, only the option for map mnt_ns_filter is available.
 
 The fork is used as a part of updated inspector gadget container and is cloned and built during the compilation of the image.
 
