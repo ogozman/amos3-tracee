@@ -5,6 +5,17 @@
 [![License](https://img.shields.io/github/license/aquasecurity/tracee)](https://github.com/aquasecurity/tracee/blob/main/LICENSE)
 [![docker](https://badgen.net/docker/pulls/aquasec/tracee)](https://hub.docker.com/r/aquasec/tracee)
 
+# The nature for this Fork of Tracee
+This fork of tracee has been created in order to enable tracee to pin bpf maps for with mount namespaces ids provided by inspector gadget gadget tracer manager, which allow it to trace only the event from specific mount namespaces. It is implement and functional. In order to pin map you can call tracee with new type of argument. 
+
+```bash
+tracee --pin map:mnt_ns_filter:/path/to/map
+```
+
+This form of argument has been chose in order leave possibility of updating tracee to pin other bpf maps which are used to store filtering options in tracee or even other bpf objects. Currently, however, the option for map mnt_ns_filter is available.
+
+The fork is used as a part of updated inspector gadget container and is cloned and built during the compilation of the image.
+
 # Tracee - Container and system tracing using eBPF
 
 Tracee is a lightweight and easy to use tracing tool for Linux, which is focused on security and forensics. It allows you to observe system calls and other system events in real-time, with comprehensive filtering mechanism so you can focus on the events that are relevant to you. Unlike other tracing tools, Tracee is a security tool, which is demonstrated by features like capturing forensic artifacts from running applications, tracing non-syscall security events, and producing security insights.
