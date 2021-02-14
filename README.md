@@ -1,9 +1,7 @@
 ![Tracee Logo](images/tracee.png)
 
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/aquasecurity/tracee)](https://github.com/aquasecurity/tracee/releases)
-[![Go Report Card](https://goreportcard.com/badge/github.com/aquasecurity/tracee)](https://goreportcard.com/report/github.com/aquasecurity/tracee)
-[![License](https://img.shields.io/github/license/aquasecurity/tracee)](https://github.com/aquasecurity/tracee/blob/main/LICENSE)
-[![docker](https://badgen.net/docker/pulls/aquasec/tracee)](https://hub.docker.com/r/aquasec/tracee)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/aquasecurity/tracee)](https://github.com/ogozman/amos3-tracee/releases)
+[![License](https://img.shields.io/github/license/aquasecurity/tracee)](https://github.com/ogozman/amos3-tracee/blob/main/LICENSE)
 
 # The nature for this Fork of Tracee
 This fork of tracee has been created in order to enable tracee to pin bpf maps with mount namespace ids provided by inspector gadget gadget tracer manager, which allows it to trace only the events from specific mount namespaces. It is implemented and functional. In order to pin map you can call tracee with new type of argument. 
