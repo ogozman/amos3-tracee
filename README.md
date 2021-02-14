@@ -1,6 +1,4 @@
 ![Tracee Logo](images/tracee.png)
-
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/aquasecurity/tracee)](https://github.com/ogozman/amos3-tracee/releases)
 [![License](https://img.shields.io/github/license/aquasecurity/tracee)](https://github.com/ogozman/amos3-tracee/blob/main/LICENSE)
 
 # The nature for this Fork of Tracee
